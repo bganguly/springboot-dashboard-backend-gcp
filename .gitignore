@@ -10,3 +10,5 @@ infra/.terraform/
 *.tfvars
 !*.tfvars.example
 *.dump
+.next/
+node_modules/
