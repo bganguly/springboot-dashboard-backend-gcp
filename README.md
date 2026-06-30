@@ -43,40 +43,31 @@ source .env.gcp
 ./scripts/prepare-demo-data.sh
 ```
 
-Applies migrations, seeds demo orders (when table is empty), rebuilds all read model rollups, and prints elapsed time and row counts per phase.
+Applies migrations, seeds demo orders (when table is empty), rebuilds all read model rollups. Prints elapsed time and row counts per phase.
 
 Expected timing on `db-f1-micro`: 15–25 minutes for the 4 M order seed.
 
-#### Fast path: restore from a GCS snapshot (maintainer only)
+**Faster alternatives:**
 
-```bash
-DEMO_SNAPSHOT_GCS_URI=gs://<your-bucket>/dash/demo.dump ./scripts/prepare-demo-data.sh
-```
+- **GCS snapshot (maintainer only)** — set `DEMO_SNAPSHOT_GCS_URI=gs://<bucket>/dash/demo.dump` before running; the script restores from the snapshot instead of seeding. Falls back to full seed automatically if the URI is unset or inaccessible.
 
-Falls back to full seed automatically when the URI is unset or inaccessible — nothing to configure for developers without the bucket.
+- **In-region from Cloud Shell** (fastest — avoids local network) — run from GCP Cloud Shell in the same region as Cloud SQL:
 
-#### In-region bake/restore (fastest — avoids local network)
+  ```bash
+  sudo apt-get install -y postgresql-client-15
+  export DATABASE_URL='<paste from ./scripts/database-url.sh>'
+  export BUCKET=<your-private-bucket>
 
-Run from **GCP Cloud Shell** in the same region as Cloud SQL:
+  # bake
+  pg_dump --format=custom --no-owner --no-privileges "$DATABASE_URL" \
+    | gsutil cp - "gs://$BUCKET/dash/demo.dump"
 
-```bash
-sudo apt-get install -y postgresql-client-15
-
-export DATABASE_URL='<paste from ./scripts/database-url.sh on your local terminal>'
-export BUCKET=<your-private-bucket>
-
-# bake: stream directly to GCS (no local file)
-pg_dump --format=custom --no-owner --no-privileges "$DATABASE_URL" \
-  | gsutil cp - "gs://$BUCKET/dash/demo.dump"
-
-# restore
-gsutil cp "gs://$BUCKET/dash/demo.dump" ~/demo.dump
-pg_restore --no-owner --no-privileges --clean --if-exists --jobs 4 \
-  --dbname "$DATABASE_URL" ~/demo.dump
-rm -f ~/demo.dump
-```
-
-`pg_restore --clean --if-exists` drops and recreates objects — intended for refreshing a demo, destructive otherwise.
+  # restore (destructive — drops and recreates objects)
+  gsutil cp "gs://$BUCKET/dash/demo.dump" ~/demo.dump
+  pg_restore --no-owner --no-privileges --clean --if-exists --jobs 4 \
+    --dbname "$DATABASE_URL" ~/demo.dump
+  rm -f ~/demo.dump
+  ```
 
 ### 3. Deploy backend
 
