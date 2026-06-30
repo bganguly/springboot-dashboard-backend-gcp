@@ -14,21 +14,11 @@ Checks prerequisites, creates and seeds the database if needed (prompts before a
 
 ### Prerequisites
 
-- **Java 21** — install via [SDKMAN](https://sdkman.io/) (workaround for older Macs: `brew install java` can trigger a 30–60 min source build):
+`local-dev.sh` checks all three and prints install instructions if anything is missing:
 
-  ```bash
-  curl -s "https://get.sdkman.io" | bash
-  source "$HOME/.sdkman/bin/sdkman-init.sh"
-  sdk install java 21-tem
-  ```
-
-- **Gradle** — also via SDKMAN (same reason — do **not** use `brew install gradle`):
-
-  ```bash
-  sdk install gradle
-  ```
-
-- **Postgres** installed locally (`brew install postgresql@15`) — `local-dev.sh` starts it automatically if needed
+- **Java 21** — checked via [SDKMAN](https://sdkman.io/) (workaround for older Macs where `brew install java` triggers a 30–60 min source build)
+- **Gradle** — also via SDKMAN (same reason)
+- **Postgres** — started automatically via `brew services` if installed but not running
 
 ---
 
