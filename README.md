@@ -6,51 +6,40 @@ Sister repo: [dashboard-frontend](https://github.com/bganguly/dashboard-frontend
 
 ## Local Dev
 
+```bash
+./scripts/local-dev.sh
+```
+
+Checks prerequisites, creates and seeds the database if needed (prompts before any writes), runs diagnostics, then starts on http://localhost:8080.
+
+Set `ORDERS=N` to seed a different row count (default 100 k; production uses 4 M).
+
 ### Prerequisites
 
-- Java 21
-- Gradle via [SDKMAN](https://sdkman.io/) — do **not** use `brew install gradle` (pulls in a 30-60 min source-build chain):
+- **Java 21** — install via [SDKMAN](https://sdkman.io/) (workaround for older Macs: `brew install java` can trigger a 30–60 min source build):
 
-```bash
-curl -s "https://get.sdkman.io" | bash
-source "$HOME/.sdkman/bin/sdkman-init.sh"
-sdk install gradle
-```
+  ```bash
+  curl -s "https://get.sdkman.io" | bash
+  source "$HOME/.sdkman/bin/sdkman-init.sh"
+  sdk install java 21-tem
+  ```
 
-- Postgres running locally
+- **Gradle** — also via SDKMAN (same reason — do **not** use `brew install gradle`):
 
-### Quick Start (first time)
+  ```bash
+  sdk install gradle
+  ```
 
-```bash
-# 1. Generate the Gradle wrapper
-gradle wrapper
+- **Postgres** running locally:
 
-# 2. Create and seed the database (100 k rows; default is 4 M, too slow locally)
-createdb dashboard_perf
-psql -d dashboard_perf -f src/main/resources/db/migration/V1__initial_schema.sql
-psql -d dashboard_perf -f src/main/resources/db/migration/V2__daily_summary.sql
-psql -d dashboard_perf -f src/main/resources/db/migration/V3__indexes_and_read_models.sql
-psql -d dashboard_perf -v orders=100000 -f scripts/seed-large.sql
-psql -d dashboard_perf -f scripts/rebuild-dashboard-read-models.sql
-
-# 3. Verify — prints Java version, Postgres readiness, row counts, Flyway state
-DATABASE_URL="jdbc:postgresql://localhost:5432/dashboard_perf?user=$(whoami)" ./scripts/diagnose.sh
-
-# 4. Start
-DATABASE_URL="jdbc:postgresql://localhost:5432/dashboard_perf?user=$(whoami)" ./gradlew bootRun
-```
-
-Listens on http://localhost:8080. The frontend proxies `/api/*` here in dev.
+  ```bash
+  brew install postgresql@15
+  brew services start postgresql@15
+  ```
 
 ---
 
 ## GCP Deploy
-
-### Prerequisites
-
-- `gcloud` CLI authenticated (`gcloud auth login`)
-- Terraform >= 1.5
-- Docker
 
 ### 1. Bring infra up
 
@@ -71,28 +60,21 @@ source .env.gcp
 ./scripts/prepare-demo-data.sh
 ```
 
-- Applies Flyway migrations
-- Seeds demo orders when the table is empty
-- Rebuilds all dashboard read models
-- Prints elapsed time and row-count summary for each phase
+Applies migrations, seeds demo orders (when table is empty), rebuilds all read model rollups, and prints elapsed time and row counts per phase.
 
 Expected timing on `db-f1-micro`: 15–25 minutes for the 4 M order seed.
 
 #### Fast path: restore from a GCS snapshot (maintainer only)
 
 ```bash
-# bake the current database into a private GCS snapshot
-DEMO_SNAPSHOT_GCS_URI=gs://<your-bucket>/dash/demo.dump ./scripts/bake-demo-snapshot.sh
-
-# restore instead of re-seeding
 DEMO_SNAPSHOT_GCS_URI=gs://<your-bucket>/dash/demo.dump ./scripts/prepare-demo-data.sh
 ```
 
-The bucket is private. Developers without the URI fall back to the full seed automatically — nothing to configure.
+Falls back to full seed automatically when the URI is unset or inaccessible — nothing to configure for developers without the bucket.
 
-#### In-region bake/restore (fastest — avoids the local network entirely)
+#### In-region bake/restore (fastest — avoids local network)
 
-Run from **GCP Cloud Shell** in the same region as Cloud SQL to keep traffic off your local link.
+Run from **GCP Cloud Shell** in the same region as Cloud SQL:
 
 ```bash
 sudo apt-get install -y postgresql-client-15
