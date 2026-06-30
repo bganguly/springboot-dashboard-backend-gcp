@@ -1,0 +1,245 @@
+package com.dashboard.service;
+
+import com.dashboard.dto.DailyAggregateDTO;
+import lombok.RequiredArgsConstructor;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.util.*;
+
+@Service
+@RequiredArgsConstructor
+public class AggregateService {
+
+    private final NamedParameterJdbcTemplate jdbc;
+
+    public List<DailyAggregateDTO> getDailyAggregates(
+            String from, String to, String q,
+            String status, String regionCode,
+            BigDecimal minTotal, BigDecimal maxTotal,
+            Integer topCategories) {
+
+        boolean hasQ = q != null && !q.isBlank();
+        boolean isMultiToken = hasQ && q.strip().contains(" ");
+        boolean hasStatus = status != null && !status.isBlank();
+        boolean hasRegion = regionCode != null && !regionCode.isBlank();
+        boolean hasTotal = minTotal != null || maxTotal != null;
+
+        List<Map<String, Object>> rows;
+
+        if (!hasQ && !hasStatus && !hasRegion && !hasTotal) {
+            rows = queryDailySummary(from, to, regionCode);
+        } else if (hasQ && isMultiToken) {
+            rows = queryDirectIlike(from, to, q, status, regionCode, minTotal, maxTotal);
+        } else if (hasQ && !hasStatus && !hasRegion && !hasTotal) {
+            rows = queryTokenRollup(from, to, q);
+        } else if (hasQ) {
+            rows = queryTokenCategorySummary(from, to, q, status, regionCode);
+        } else if (hasStatus && !hasRegion && !hasTotal) {
+            rows = queryStatusCategorySummary(from, to, status);
+        } else if ((hasStatus || hasRegion) && !hasTotal) {
+            rows = queryFilterCategorySummary(from, to, status, regionCode);
+        } else {
+            // total bounds or complex combo — fall back to order_category_facts
+            rows = queryOrderCategoryFacts(from, to, status, regionCode, minTotal, maxTotal);
+        }
+
+        return buildResult(rows, topCategories != null ? topCategories : 5);
+    }
+
+    private List<Map<String, Object>> queryDailySummary(String from, String to, String regionCode) {
+        var params = new MapSqlParameterSource()
+                .addValue("from", from).addValue("to", to);
+        String where = "WHERE date BETWEEN :from::date AND :to::date";
+        if (regionCode != null && !regionCode.isBlank()) {
+            where += " AND \"regionCode\" = ANY(ARRAY[" + quoteList(regionCode) + "])";
+        }
+        return jdbc.queryForList(
+                "SELECT date::text AS day, \"categoryName\" AS category, " +
+                "SUM(\"totalOrders\") AS total_orders, SUM(\"totalRevenue\") AS total_revenue, " +
+                "SUM(\"totalItems\") AS total_items FROM daily_summary " + where +
+                " GROUP BY date, \"categoryName\" ORDER BY date", params);
+    }
+
+    private List<Map<String, Object>> queryTokenRollup(String from, String to, String q) {
+        String token = q.strip().toLowerCase();
+        var params = new MapSqlParameterSource()
+                .addValue("from", from).addValue("to", to).addValue("token", token);
+        return jdbc.queryForList(
+                "SELECT date::text AS day, \"categoryName\" AS category, " +
+                "SUM(\"totalOrders\") AS total_orders, SUM(\"totalRevenue\") AS total_revenue, " +
+                "SUM(\"totalItems\") AS total_items FROM daily_customer_token_category_rollup " +
+                "WHERE token = :token AND date BETWEEN :from::date AND :to::date " +
+                "GROUP BY date, \"categoryName\" ORDER BY date", params);
+    }
+
+    private List<Map<String, Object>> queryTokenCategorySummary(
+            String from, String to, String q, String status, String regionCode) {
+        String token = q.strip().toLowerCase();
+        var params = new MapSqlParameterSource()
+                .addValue("from", from).addValue("to", to).addValue("token", token);
+        List<String> extra = new ArrayList<>();
+        if (status != null && !status.isBlank())
+            extra.add("status = ANY(ARRAY[" + quoteStatusList(status) + "])");
+        if (regionCode != null && !regionCode.isBlank())
+            extra.add("\"regionCode\" = ANY(ARRAY[" + quoteList(regionCode) + "])");
+        String where = "WHERE token = :token AND date BETWEEN :from::date AND :to::date" +
+                (extra.isEmpty() ? "" : " AND " + String.join(" AND ", extra));
+        return jdbc.queryForList(
+                "SELECT date::text AS day, \"categoryName\" AS category, " +
+                "SUM(\"totalOrders\") AS total_orders, SUM(\"totalRevenue\") AS total_revenue, " +
+                "SUM(\"totalItems\") AS total_items FROM daily_customer_token_category_summary " +
+                where + " GROUP BY date, \"categoryName\" ORDER BY date", params);
+    }
+
+    private List<Map<String, Object>> queryStatusCategorySummary(String from, String to, String status) {
+        var params = new MapSqlParameterSource().addValue("from", from).addValue("to", to);
+        return jdbc.queryForList(
+                "SELECT date::text AS day, \"categoryName\" AS category, " +
+                "SUM(\"totalOrders\") AS total_orders, SUM(\"totalRevenue\") AS total_revenue, " +
+                "SUM(\"totalItems\") AS total_items FROM daily_status_category_summary " +
+                "WHERE status = ANY(ARRAY[" + quoteStatusList(status) + "]) " +
+                "AND date BETWEEN :from::date AND :to::date " +
+                "GROUP BY date, \"categoryName\" ORDER BY date", params);
+    }
+
+    private List<Map<String, Object>> queryFilterCategorySummary(
+            String from, String to, String status, String regionCode) {
+        var params = new MapSqlParameterSource().addValue("from", from).addValue("to", to);
+        List<String> extra = new ArrayList<>();
+        if (status != null && !status.isBlank())
+            extra.add("status = ANY(ARRAY[" + quoteStatusList(status) + "])");
+        if (regionCode != null && !regionCode.isBlank())
+            extra.add("\"regionCode\" = ANY(ARRAY[" + quoteList(regionCode) + "])");
+        String where = "WHERE date BETWEEN :from::date AND :to::date" +
+                (extra.isEmpty() ? "" : " AND " + String.join(" AND ", extra));
+        return jdbc.queryForList(
+                "SELECT date::text AS day, \"categoryName\" AS category, " +
+                "SUM(\"totalOrders\") AS total_orders, SUM(\"totalRevenue\") AS total_revenue, " +
+                "SUM(\"totalItems\") AS total_items FROM daily_filter_category_summary " +
+                where + " GROUP BY date, \"categoryName\" ORDER BY date", params);
+    }
+
+    private List<Map<String, Object>> queryOrderCategoryFacts(
+            String from, String to, String status, String regionCode,
+            BigDecimal minTotal, BigDecimal maxTotal) {
+        var params = new MapSqlParameterSource().addValue("from", from).addValue("to", to);
+        List<String> extra = new ArrayList<>();
+        if (status != null && !status.isBlank())
+            extra.add("status = ANY(ARRAY[" + quoteStatusList(status) + "])");
+        if (regionCode != null && !regionCode.isBlank())
+            extra.add("\"regionCode\" = ANY(ARRAY[" + quoteList(regionCode) + "])");
+        if (minTotal != null) { extra.add("\"orderTotal\" >= :minTotal"); params.addValue("minTotal", minTotal); }
+        if (maxTotal != null) { extra.add("\"orderTotal\" <= :maxTotal"); params.addValue("maxTotal", maxTotal); }
+        String where = "WHERE date BETWEEN :from::date AND :to::date" +
+                (extra.isEmpty() ? "" : " AND " + String.join(" AND ", extra));
+        return jdbc.queryForList(
+                "SELECT date::text AS day, \"categoryName\" AS category, " +
+                "COUNT(DISTINCT \"orderId\") AS total_orders, SUM(\"totalRevenue\") AS total_revenue, " +
+                "SUM(\"totalItems\") AS total_items FROM order_category_facts " +
+                where + " GROUP BY date, \"categoryName\" ORDER BY date", params);
+    }
+
+    private List<Map<String, Object>> queryDirectIlike(
+            String from, String to, String q,
+            String status, String regionCode,
+            BigDecimal minTotal, BigDecimal maxTotal) {
+        var params = new MapSqlParameterSource()
+                .addValue("from", from).addValue("to", to)
+                .addValue("q", "%" + q.strip() + "%");
+        List<String> extra = new ArrayList<>();
+        if (status != null && !status.isBlank())
+            extra.add("o.status = ANY(ARRAY[" + quoteStatusList(status) + "])");
+        if (regionCode != null && !regionCode.isBlank())
+            extra.add("r.code = ANY(ARRAY[" + quoteList(regionCode) + "])");
+        if (minTotal != null) { extra.add("o.total >= :minTotal"); params.addValue("minTotal", minTotal); }
+        if (maxTotal != null) { extra.add("o.total <= :maxTotal"); params.addValue("maxTotal", maxTotal); }
+        String extraWhere = extra.isEmpty() ? "" : " AND " + String.join(" AND ", extra);
+        return jdbc.queryForList(
+                "SELECT o.\"placedAt\"::date::text AS day, cat.name AS category, " +
+                "COUNT(DISTINCT o.id)::bigint AS total_orders, " +
+                "COALESCE(SUM(oi.quantity * oi.\"unitPrice\" * (1 - oi.discount)), 0) AS total_revenue, " +
+                "COALESCE(SUM(oi.quantity), 0)::bigint AS total_items " +
+                "FROM orders o " +
+                "JOIN customers c ON c.id = o.\"customerId\" " +
+                "JOIN regions r ON r.id = o.\"regionId\" " +
+                "JOIN order_items oi ON oi.\"orderId\" = o.id " +
+                "JOIN products p ON p.id = oi.\"productId\" " +
+                "JOIN categories cat ON cat.id = p.\"categoryId\" " +
+                "WHERE (c.\"firstName\" || ' ' || c.\"lastName\" || ' ' || c.email) ILIKE :q " +
+                "AND o.\"placedAt\"::date BETWEEN :from::date AND :to::date" +
+                extraWhere +
+                " GROUP BY o.\"placedAt\"::date, cat.name ORDER BY o.\"placedAt\"::date",
+                params);
+    }
+
+    private List<DailyAggregateDTO> buildResult(List<Map<String, Object>> rows, int topN) {
+        // Group by day
+        LinkedHashMap<String, Map<String, long[]>> byDay = new LinkedHashMap<>();
+        for (var row : rows) {
+            String day = (String) row.get("day");
+            String cat = (String) row.get("category");
+            long orders = toLong(row.get("total_orders"));
+            double revenue = toDouble(row.get("total_revenue"));
+            long items = toLong(row.get("total_items"));
+            byDay.computeIfAbsent(day, k -> new LinkedHashMap<>())
+                    .put(cat, new long[]{orders, Double.doubleToLongBits(revenue), items});
+        }
+
+        // Find top-N categories by total orders across the range
+        Map<String, Long> catTotals = new HashMap<>();
+        for (var dayMap : byDay.values())
+            dayMap.forEach((cat, v) -> catTotals.merge(cat, v[0], Long::sum));
+        Set<String> top = catTotals.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .limit(topN).map(Map.Entry::getKey)
+                .collect(java.util.LinkedHashSet::new, LinkedHashSet::add, LinkedHashSet::addAll);
+
+        List<DailyAggregateDTO> result = new ArrayList<>();
+        for (var entry : byDay.entrySet()) {
+            Map<String, DailyAggregateDTO.CategoryAggregateDTO> cats = new LinkedHashMap<>();
+            long othersOrders = 0; double othersRevenue = 0; long othersItems = 0;
+            for (var ce : entry.getValue().entrySet()) {
+                long o = ce.getValue()[0];
+                double r = Double.longBitsToDouble(ce.getValue()[1]);
+                long i = ce.getValue()[2];
+                if (top.contains(ce.getKey())) {
+                    cats.put(ce.getKey(), new DailyAggregateDTO.CategoryAggregateDTO(
+                            o, r, i, o > 0 ? r / o : 0));
+                } else {
+                    othersOrders += o; othersRevenue += r; othersItems += i;
+                }
+            }
+            if (othersOrders > 0)
+                cats.put("Others", new DailyAggregateDTO.CategoryAggregateDTO(
+                        othersOrders, othersRevenue, othersItems,
+                        othersOrders > 0 ? othersRevenue / othersOrders : 0));
+            result.add(new DailyAggregateDTO(entry.getKey(), cats));
+        }
+        return result;
+    }
+
+    private String quoteList(String csv) {
+        return Arrays.stream(csv.split(",")).map(String::strip)
+                .filter(s -> !s.isEmpty()).map(s -> "'" + s.replace("'", "''") + "'")
+                .collect(java.util.stream.Collectors.joining(","));
+    }
+
+    private String quoteStatusList(String csv) {
+        return Arrays.stream(csv.split(",")).map(String::strip)
+                .filter(s -> !s.isEmpty())
+                .map(s -> "'" + s.replace("'", "''") + "'::\"OrderStatus\"")
+                .collect(java.util.stream.Collectors.joining(","));
+    }
+
+    private long toLong(Object v) {
+        return v instanceof Number n ? n.longValue() : 0L;
+    }
+
+    private double toDouble(Object v) {
+        if (v instanceof BigDecimal bd) return bd.doubleValue();
+        return v instanceof Number n ? n.doubleValue() : 0.0;
+    }
+}

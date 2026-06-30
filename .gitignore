@@ -1,0 +1,12 @@
+.env
+.env.local
+.env.gcp
+build/
+.gradle/
+*.class
+*.jar
+infra/terraform.tfstate*
+infra/.terraform/
+*.tfvars
+!*.tfvars.example
+*.dump

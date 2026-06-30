@@ -1,0 +1,12 @@
+{
+  "/_global-error/page": "app/_global-error/page.js",
+  "/_not-found/page": "app/_not-found/page.js",
+  "/api/aggregates/route": "app/api/aggregates/route.js",
+  "/api/customers/route": "app/api/customers/route.js",
+  "/api/dashboard-search/route": "app/api/dashboard-search/route.js",
+  "/api/orders/route": "app/api/orders/route.js",
+  "/api/regions/route": "app/api/regions/route.js",
+  "/api/seed-stats/route": "app/api/seed-stats/route.js",
+  "/favicon.ico/route": "app/favicon.ico/route.js",
+  "/page": "app/page.js"
+}
