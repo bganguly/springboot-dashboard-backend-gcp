@@ -11,7 +11,6 @@ Sister repo: [dashboard-frontend](https://github.com/bganguly/dashboard-frontend
 | | |
 |---|---|
 | **Java / Spring Boot back-end** | Spring Boot 4, Java 21, NamedParameterJdbcTemplate, Flyway |
-| **React / TypeScript front-end** | [dashboard-frontend](https://github.com/bganguly/dashboard-frontend) — React 19, TypeScript, Vite |
 | **PostgreSQL — SQL, DML/DDL, performance tuning** | Cloud SQL PG 16; Flyway DDL migrations; GIN trigram index; pre-aggregated summary tables for sub-second chart queries on 4 M rows |
 | **Serverless / cloud-native computing** | Cloud Run — fully serverless, scales to zero, no cluster management |
 | **IaC (Terraform equivalent)** | Pulumi TypeScript (`infra/index.ts`) — VPC, Cloud SQL, Cloud Run, IAM, Secret Manager, Artifact Registry all declared |
