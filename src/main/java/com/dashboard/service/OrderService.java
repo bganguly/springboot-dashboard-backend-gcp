@@ -53,9 +53,9 @@ public class OrderService {
 
         // Data page
         String orderBy = switch (safeSort) {
-            case "customer" -> "c.\"firstName\" " + safeDir + ", c.\"lastName\" " + safeDir;
-            case "total"    -> "o.total " + safeDir;
-            case "status"   -> "o.status " + safeDir;
+            case "customer" -> "c.\"firstName\" " + safeDir + ", c.\"lastName\" " + safeDir + ", o.\"placedAt\" DESC";
+            case "total"    -> "o.total " + safeDir + ", o.\"placedAt\" DESC";
+            case "status"   -> "o.status " + safeDir + ", o.\"placedAt\" DESC";
             case "id"       -> "o.id " + safeDir;
             default         -> "o.\"placedAt\" " + safeDir;
         };
