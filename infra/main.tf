@@ -72,8 +72,13 @@ resource "google_sql_database_instance" "pg" {
       private_network = google_compute_network.main.id
     }
 
-    database_flags { name = "max_connections" value = "200" }
-    backup_configuration { enabled = true }
+    database_flags {
+      name  = "max_connections"
+      value = "200"
+    }
+    backup_configuration {
+      enabled = true
+    }
   }
 
   deletion_protection = false
@@ -94,7 +99,9 @@ resource "google_sql_user" "app" {
 resource "google_secret_manager_secret" "database_url" {
   secret_id  = "${var.name_prefix}-database-url"
   depends_on = [google_project_service.apis]
-  replication { auto {} }
+  replication {
+    auto {}
+  }
 }
 
 resource "google_secret_manager_secret_version" "database_url" {
@@ -158,10 +165,16 @@ resource "google_cloud_run_v2_service" "backend" {
       }
     }
 
-    scaling { min_instance_count = 1 max_instance_count = 5 }
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 5
+    }
   }
 
-  traffic { type = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST" percent = 100 }
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
 }
 
 resource "google_cloud_run_v2_service_iam_member" "backend_public" {
@@ -190,10 +203,16 @@ resource "google_cloud_run_v2_service" "frontend" {
       }
     }
 
-    scaling { min_instance_count = 1 max_instance_count = 3 }
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 3
+    }
   }
 
-  traffic { type = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST" percent = 100 }
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
 }
 
 resource "google_cloud_run_v2_service_iam_member" "frontend_public" {
