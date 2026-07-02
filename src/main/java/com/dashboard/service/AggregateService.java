@@ -219,39 +219,6 @@ public class AggregateService {
                 params);
     }
 
-    private List<Map<String, Object>> queryDirectIlike(
-            String from, String to, String q,
-            String status, String regionCode,
-            BigDecimal minTotal, BigDecimal maxTotal) {
-        var params = new MapSqlParameterSource()
-                .addValue("from", from).addValue("to", to)
-                .addValue("q", "%" + q.strip() + "%");
-        List<String> extra = new ArrayList<>();
-        if (status != null && !status.isBlank())
-            extra.add("o.status = ANY(ARRAY[" + quoteStatusList(status) + "])");
-        if (regionCode != null && !regionCode.isBlank())
-            extra.add("r.code = ANY(ARRAY[" + quoteList(regionCode) + "])");
-        if (minTotal != null) { extra.add("o.total >= :minTotal"); params.addValue("minTotal", minTotal); }
-        if (maxTotal != null) { extra.add("o.total <= :maxTotal"); params.addValue("maxTotal", maxTotal); }
-        String extraWhere = extra.isEmpty() ? "" : " AND " + String.join(" AND ", extra);
-        return jdbc.queryForList(
-                "SELECT o.\"placedAt\"::date::text AS day, cat.name AS category, " +
-                "COUNT(DISTINCT o.id)::bigint AS total_orders, " +
-                "COALESCE(SUM(oi.quantity * oi.\"unitPrice\" * (1 - oi.discount)), 0) AS total_revenue, " +
-                "COALESCE(SUM(oi.quantity), 0)::bigint AS total_items " +
-                "FROM orders o " +
-                "JOIN customers c ON c.id = o.\"customerId\" " +
-                "JOIN regions r ON r.id = o.\"regionId\" " +
-                "JOIN order_items oi ON oi.\"orderId\" = o.id " +
-                "JOIN products p ON p.id = oi.\"productId\" " +
-                "JOIN categories cat ON cat.id = p.\"categoryId\" " +
-                "WHERE (c.\"firstName\" || ' ' || c.\"lastName\") ILIKE :q " +
-                "AND o.\"placedAt\"::date BETWEEN :from::date AND :to::date" +
-                extraWhere +
-                " GROUP BY o.\"placedAt\"::date, cat.name ORDER BY o.\"placedAt\"::date",
-                params);
-    }
-
     private List<DailyAggregateDTO> buildResult(List<Map<String, Object>> rows, int topN) {
         // Group by day
         LinkedHashMap<String, Map<String, long[]>> byDay = new LinkedHashMap<>();
