@@ -56,7 +56,7 @@ public class CountCacheWarmup implements ApplicationRunner {
 
                 List<Long> hit = jdbc.queryForList(
                     "SELECT total FROM count_cache WHERE cache_key = :k " +
-                    "AND cached_at > NOW() - INTERVAL '10 minutes'",
+                    "AND cached_at > NOW() - INTERVAL '30 days'",
                     new MapSqlParameterSource("k", key), Long.class);
                 if (!hit.isEmpty()) continue;
 

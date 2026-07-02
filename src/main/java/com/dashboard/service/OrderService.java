@@ -243,7 +243,7 @@ public class OrderService {
     private long cachedCount(String countSql, MapSqlParameterSource params, String cacheKey) {
         try {
             List<Long> hit = jdbc.queryForList(
-                "SELECT total FROM count_cache WHERE cache_key = :k AND cached_at > NOW() - INTERVAL '10 minutes'",
+                "SELECT total FROM count_cache WHERE cache_key = :k AND cached_at > NOW() - INTERVAL '30 days'",
                 new MapSqlParameterSource("k", cacheKey), Long.class);
             if (!hit.isEmpty()) return hit.get(0);
         } catch (Exception ignored) {}
