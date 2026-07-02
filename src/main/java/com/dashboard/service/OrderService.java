@@ -49,7 +49,8 @@ public class OrderService {
         boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
         String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
         String countSql = ctePrefix + "SELECT COUNT(*) FROM orders o " + regionJoin + where;
-        long total = Objects.requireNonNull(jdbc.queryForObject(countSql, params, Long.class));
+        String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
+        long total = cachedCount(countSql, params, cacheKey);
         boolean approximate = false;
 
         // Data page
@@ -237,5 +238,37 @@ public class OrderService {
         if (ts == null) return null;
         if (ts instanceof LocalDateTime ldt) return ISO.format(ldt);
         return ts.toString();
+    }
+
+    private long cachedCount(String countSql, MapSqlParameterSource params, String cacheKey) {
+        try {
+            List<Long> hit = jdbc.queryForList(
+                "SELECT total FROM count_cache WHERE cache_key = :k AND cached_at > NOW() - INTERVAL '10 minutes'",
+                new MapSqlParameterSource("k", cacheKey), Long.class);
+            if (!hit.isEmpty()) return hit.get(0);
+        } catch (Exception ignored) {}
+
+        long total = Objects.requireNonNull(jdbc.queryForObject(countSql, params, Long.class));
+
+        try {
+            jdbc.update(
+                "INSERT INTO count_cache (cache_key, total, cached_at) VALUES (:k, :t, NOW()) " +
+                "ON CONFLICT (cache_key) DO UPDATE SET total = :t, cached_at = NOW()",
+                new MapSqlParameterSource("k", cacheKey).addValue("t", total));
+        } catch (Exception ignored) {}
+
+        return total;
+    }
+
+    private String buildCountCacheKey(String q, String status, String regionCode,
+                                      String from, String to,
+                                      BigDecimal minTotal, BigDecimal maxTotal) {
+        return "q=" + (q != null ? q.strip().toLowerCase() : "") +
+               "&status=" + (status != null ? status : "") +
+               "&regionCode=" + (regionCode != null ? regionCode : "") +
+               "&from=" + (from != null ? from : "") +
+               "&to=" + (to != null ? to : "") +
+               "&minTotal=" + (minTotal != null ? minTotal.toPlainString() : "") +
+               "&maxTotal=" + (maxTotal != null ? maxTotal.toPlainString() : "");
     }
 }
