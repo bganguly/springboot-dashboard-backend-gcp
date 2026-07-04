@@ -6,7 +6,9 @@ cd "$ROOT_DIR"
 
 ORDERS="${ORDERS:-100000}"
 DB="dashboard_perf"
-DB_URL="jdbc:postgresql://localhost:5432/${DB}?user=$(whoami)"
+# Same postgresql://user:pass@host/db shape DataSourceConfig expects for Cloud
+# SQL — empty password relies on pg_hba.conf trust for host 127.0.0.1/::1.
+DB_URL="postgresql://$(whoami):@localhost:5432/${DB}"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 fail() { printf '\nERROR: %s\n\n' "$*" >&2; exit 1; }

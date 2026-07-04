@@ -44,10 +44,11 @@ class FlywayConfigTest {
     void staleBaseline_clearsHistoryThenMigrates() throws Exception {
         ResultSet rs = countResult(0);
         when(stmt.executeQuery(anyString())).thenReturn(rs);
+        when(stmt.executeQuery(contains("orders"))).thenThrow(new SQLException("relation \"orders\" does not exist"));
 
         new FlywayConfig().resetOnStaleBaseline().migrate(flyway);
 
-        verify(stmt).execute(contains("DELETE FROM flyway_schema_history"));
+        verify(stmt).execute(contains("DROP TABLE flyway_schema_history"));
         verify(flyway).migrate();
     }
 
@@ -55,6 +56,7 @@ class FlywayConfigTest {
     void versionedMigrationsPresent_leavesHistoryAlone() throws Exception {
         ResultSet rs = countResult(3);
         when(stmt.executeQuery(anyString())).thenReturn(rs);
+        when(stmt.executeQuery(contains("orders"))).thenThrow(new SQLException("relation \"orders\" does not exist"));
 
         new FlywayConfig().resetOnStaleBaseline().migrate(flyway);
 

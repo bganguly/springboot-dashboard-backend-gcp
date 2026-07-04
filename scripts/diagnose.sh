@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-DB_URL="${DATABASE_URL:-jdbc:postgresql://localhost:5432/dashboard_perf?user=bikram}"
+DB_URL="${DATABASE_URL:-postgresql://$(whoami):@localhost:5432/dashboard_perf}"
 DB="${DB_URL##*/}"; DB="${DB%%\?*}"
 
 run_psql() { psql -d "$DB" -c "$1" 2>&1; }
