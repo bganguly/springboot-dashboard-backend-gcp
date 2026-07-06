@@ -35,4 +35,5 @@ fi
 export DATABASE_URL
 echo "[start] DATABASE_URL ready; starting backend on :8080"
 cd "$ROOT_DIR"
+./scripts/free-port.sh 8080
 ./gradlew bootRun

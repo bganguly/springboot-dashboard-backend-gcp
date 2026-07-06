@@ -14,6 +14,23 @@ import java.util.*;
 public class AggregateService {
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final OrderService orderService;
+
+    /**
+     * Exact distinct order count for the same filters as getDailyAggregates —
+     * reuses /api/orders's identical cached exact-count path (same cache key),
+     * so the two numbers are byte-identical whenever they cover the same
+     * range/filters. This exists because the per-category rows above cannot be
+     * summed into a grand total: an order with items in two categories gets
+     * totalOrders=1 in EACH category's row (correct for the category
+     * breakdown), so summing across categories double-counts any order
+     * spanning more than one category.
+     */
+    public long getExactTotal(String from, String to, String q,
+                               String status, String regionCode,
+                               BigDecimal minTotal, BigDecimal maxTotal) {
+        return orderService.exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
+    }
 
     public List<DailyAggregateDTO> getDailyAggregates(
             String from, String to, String q,

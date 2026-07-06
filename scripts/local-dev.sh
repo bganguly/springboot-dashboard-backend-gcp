@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 ORDERS="${ORDERS:-100000}"
-DB="dashboard_perf"
+DB="database_flyway_orm"
 # Same postgresql://user:pass@host/db shape DataSourceConfig expects for Cloud
 # SQL — empty password relies on pg_hba.conf trust for host 127.0.0.1/::1.
 DB_URL="postgresql://$(whoami):@localhost:5432/${DB}"
@@ -92,4 +92,5 @@ DATABASE_URL="$DB_URL" ./scripts/diagnose.sh
 
 # ── start ─────────────────────────────────────────────────────────────────────
 printf '\n=== starting backend :8080 ===\n'
+"$ROOT_DIR/scripts/free-port.sh" 8080
 DATABASE_URL="$DB_URL" ./gradlew bootRun

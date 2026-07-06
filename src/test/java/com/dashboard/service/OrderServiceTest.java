@@ -248,6 +248,33 @@ class OrderServiceTest {
     }
 
     @Test
+    void createOrder_invalidatesCountCacheScopedToMatchingSearchTokens() {
+        Customer customer = new Customer();
+        customer.setId(7);
+        Region region = new Region();
+        region.setId(3);
+        Product product = new Product();
+        product.setId(55);
+        when(customerRepository.findById(7)).thenReturn(Optional.of(customer));
+        when(regionRepository.findById(3)).thenReturn(Optional.of(region));
+        when(productRepository.findById(55)).thenReturn(Optional.of(product));
+        when(orderRepository.save(any(Order.class))).thenAnswer(inv -> {
+            Order o = inv.getArgument(0);
+            o.setId(99);
+            return o;
+        });
+        when(jdbc.queryForObject(contains("SELECT search_text"), any(SqlParameterSource.class), eq(String.class)))
+                .thenReturn("jane banks 123 main st");
+
+        service.createOrder(new CreateOrderRequest(7, 3, null, null,
+                List.of(new CreateOrderRequest.Item(55, 1, BigDecimal.ONE, null))));
+
+        var captor = ArgumentCaptor.forClass(SqlParameterSource.class);
+        verify(jdbc).update(contains("DELETE FROM count_cache"), captor.capture());
+        assertThat(captor.getValue().getValue("searchText")).isEqualTo("jane banks 123 main st");
+    }
+
+    @Test
     void createOrder_usesExplicitCurrency() {
         Customer customer = new Customer();
         Region region = new Region();

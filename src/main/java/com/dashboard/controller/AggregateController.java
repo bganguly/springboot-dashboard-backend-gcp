@@ -7,6 +7,8 @@ import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 @RestController
 @RequestMapping("/api/aggregates")
@@ -14,6 +16,7 @@ import java.util.Map;
 public class AggregateController {
 
     private final AggregateService aggregateService;
+    private final Executor virtualThreadExecutor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
 
     @GetMapping
     public ResponseEntity<?> get(
@@ -25,7 +28,23 @@ public class AggregateController {
             @RequestParam(required = false) BigDecimal minTotal,
             @RequestParam(required = false) BigDecimal maxTotal,
             @RequestParam(required = false) Integer topCategories) {
-        var data = aggregateService.getDailyAggregates(from, to, q, status, regionCode, minTotal, maxTotal, topCategories);
-        return ResponseEntity.ok(Map.of("data", data));
+        // The category breakdown and the exact total are independent queries
+        // over the same range/filters — run them concurrently (each on its
+        // own DB connection) instead of back-to-back so the request's latency
+        // is max(query) rather than the sum of both.
+        var dataFuture = CompletableFuture.supplyAsync(
+                () -> aggregateService.getDailyAggregates(from, to, q, status, regionCode, minTotal, maxTotal, topCategories),
+                virtualThreadExecutor);
+        // Exact distinct order count for this same range/filters — see
+        // AggregateService.getExactTotal. Preferred over summing category
+        // rows, which double-counts any order whose items span more than one
+        // category.
+        var totalFuture = CompletableFuture.supplyAsync(
+                () -> aggregateService.getExactTotal(from, to, q, status, regionCode, minTotal, maxTotal),
+                virtualThreadExecutor);
+
+        var data = dataFuture.join();
+        var totalOrders = totalFuture.join();
+        return ResponseEntity.ok(Map.of("data", data, "totalOrders", totalOrders));
     }
 }

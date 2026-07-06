@@ -25,7 +25,7 @@ class AggregateServiceTest {
     @BeforeEach
     void setUp() {
         jdbc = mock(NamedParameterJdbcTemplate.class);
-        service = new AggregateService(jdbc);
+        service = new AggregateService(jdbc, mock(OrderService.class));
     }
 
     private static Map<String, Object> row(String day, String cat, long orders, String revenue, long items) {

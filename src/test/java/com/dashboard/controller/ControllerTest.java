@@ -29,11 +29,14 @@ class ControllerTest {
         when(service.getDailyAggregates("2026-01-01", "2026-01-31", null, null, null, null, null, null))
                 .thenReturn(List.of(dto));
 
+        when(service.getExactTotal("2026-01-01", "2026-01-31", null, null, null, null, null))
+                .thenReturn(3L);
+
         var response = new AggregateController(service)
                 .get("2026-01-01", "2026-01-31", null, null, null, null, null, null);
 
         assertThat(response.getStatusCode().value()).isEqualTo(200);
-        assertThat(response.getBody()).isEqualTo(Map.of("data", List.of(dto)));
+        assertThat(response.getBody()).isEqualTo(Map.of("data", List.of(dto), "totalOrders", 3L));
     }
 
     @Test

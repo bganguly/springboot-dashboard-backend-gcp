@@ -65,6 +65,23 @@ class FlywayConfigTest {
     }
 
     @Test
+    void realHistoryAndPreexistingSchema_neverAttemptsBaseline() throws Exception {
+        // Regression: a database already fully managed by Flyway (e.g. prod)
+        // has both real history AND a pre-existing "orders" table. Baseline
+        // must never be attempted here — Flyway's baseline() refuses to run
+        // against a schema history that already has real migrations, which
+        // previously crashed the app on boot against an already-healthy DB.
+        ResultSet rs = countResult(3);
+        when(stmt.executeQuery(anyString())).thenReturn(rs);
+
+        new FlywayConfig().resetOnStaleBaseline().migrate(flyway);
+
+        verify(stmt, never()).execute(anyString());
+        verify(flyway, never()).info();
+        verify(flyway).migrate();
+    }
+
+    @Test
     void missingHistoryTable_stillMigrates() throws Exception {
         when(stmt.executeQuery(anyString())).thenThrow(new SQLException("relation does not exist"));
 

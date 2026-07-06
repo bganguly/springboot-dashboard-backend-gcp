@@ -12,25 +12,41 @@ public class FlywayConfig {
     @Bean
     public FlywayMigrationStrategy resetOnStaleBaseline() {
         return flyway -> {
-            // If flyway_schema_history contains only a BASELINE row (no versioned migrations)
-            // or nothing at all, the baseline was stamped (or a previous boot failed) without
-            // the actual DDL being fully applied through Flyway. Dropping it lets Flyway (or
-            // baselineIfDdlPreApplied below) start clean instead of tripping over a
-            // table that "already exists, and is empty".
-            try (var conn = flyway.getConfiguration().getDataSource().getConnection();
-                 var stmt = conn.createStatement()) {
-                var rs = stmt.executeQuery(
-                        "SELECT COUNT(*) FROM flyway_schema_history WHERE type != 'BASELINE'");
-                rs.next();
-                if (rs.getInt(1) == 0) {
-                    stmt.execute("DROP TABLE flyway_schema_history");
-                }
-            } catch (Exception ignored) {
-                // Table absent (truly fresh DB) — Flyway will initialise it normally.
+            // Only touch anything when Flyway has no REAL history yet (table
+            // absent, or present with only a BASELINE row). A database that
+            // already has genuine migration history — e.g. prod, managed by
+            // Flyway from day one — must be left completely alone: calling
+            // baseline() against it fails outright, which is exactly the
+            // regression this guard exists to prevent.
+            if (hasNoRealHistory(flyway)) {
+                dropStaleHistoryTable(flyway);
+                baselineIfDdlPreApplied(flyway);
             }
-            baselineIfDdlPreApplied(flyway);
             flyway.migrate();
         };
+    }
+
+    private boolean hasNoRealHistory(Flyway flyway) {
+        try (var conn = flyway.getConfiguration().getDataSource().getConnection();
+             var stmt = conn.createStatement()) {
+            var rs = stmt.executeQuery(
+                    "SELECT COUNT(*) FROM flyway_schema_history WHERE type != 'BASELINE'");
+            rs.next();
+            return rs.getInt(1) == 0;
+        } catch (Exception e) {
+            return true; // table absent — truly fresh DB
+        }
+    }
+
+    // If flyway_schema_history contains only a BASELINE row (no versioned migrations),
+    // the baseline was stamped on a fresh DB but the actual DDL was never executed.
+    // Dropping it lets Flyway (or baselineIfDdlPreApplied below) treat the DB as new
+    // instead of tripping over a table that "already exists, and is empty".
+    private void dropStaleHistoryTable(Flyway flyway) {
+        try (var conn = flyway.getConfiguration().getDataSource().getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.execute("DROP TABLE flyway_schema_history");
+        } catch (Exception ignored) {}
     }
 
     // local-dev.sh / prepare-demo-data.sh apply the V*.sql files directly via

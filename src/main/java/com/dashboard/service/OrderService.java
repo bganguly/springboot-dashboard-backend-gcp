@@ -113,6 +113,26 @@ public class OrderService {
         return new OrderListResult(data, page, pageSize, total, totalPages, approximate);
     }
 
+    /**
+     * Exact distinct order count for the given filters — the same cached-count
+     * path listOrders uses for its own total, so /api/aggregates's grand total
+     * (see AggregateService.getExactTotal) is guaranteed to agree with the
+     * orders list whenever they cover the same range/filters. Summing the
+     * per-category aggregate rows instead would double-count any order whose
+     * items span more than one category.
+     */
+    public long exactCount(String q, String status, String regionCode,
+                            String from, String to,
+                            BigDecimal minTotal, BigDecimal maxTotal) {
+        var params = new MapSqlParameterSource();
+        var where = buildWhere(q, status, regionCode, from, to, minTotal, maxTotal, params);
+        boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
+        String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
+        String countSql = "SELECT COUNT(*) FROM orders o " + regionJoin + where;
+        String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
+        return cachedCount(countSql, params, cacheKey);
+    }
+
     @Transactional
     public Map<String, Object> createOrder(CreateOrderRequest req) {
         Customer customer = customerRepository.findById(req.customerId())
@@ -149,6 +169,26 @@ public class OrderService {
         order.setTotal(total);
         order.setItems(items);
         Order saved = orderRepository.save(order);
+
+        // count_cache has no active invalidation otherwise (just a 30-day
+        // passive TTL) — a new order makes every cached exact count a
+        // potential undercount until something forces a recompute. A
+        // filter-less cache_key (q="") always covers every order, so it's
+        // always invalidated. A q= entry is only invalidated if this new
+        // order's own search_text could actually match that token — sparing
+        // every unrelated search token (e.g. CountCacheWarmup's pre-warmed
+        // customer-name lookups) from being wiped by every single order
+        // created anywhere else in the app.
+        try {
+            String searchText = jdbc.queryForObject(
+                    "SELECT search_text FROM orders WHERE id = :id",
+                    new MapSqlParameterSource("id", saved.getId()), String.class);
+            jdbc.update(
+                    "DELETE FROM count_cache WHERE " +
+                    "substring(cache_key from 'q=([^&]*)') = '' " +
+                    "OR (:searchText IS NOT NULL AND :searchText ILIKE '%' || substring(cache_key from 'q=([^&]*)') || '%')",
+                    new MapSqlParameterSource("searchText", searchText));
+        } catch (Exception ignored) {}
 
         return Map.of(
                 "id", saved.getId(),
