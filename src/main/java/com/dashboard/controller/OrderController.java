@@ -28,7 +28,22 @@ public class OrderController {
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
             @RequestParam(required = false) BigDecimal minTotal,
-            @RequestParam(required = false) BigDecimal maxTotal) {
+            @RequestParam(required = false) BigDecimal maxTotal,
+            // Optional keyset cursor for Prev/Next on the default placedAt/desc
+            // sort — an OFFSET query's cost scales with page depth, but seeking
+            // off a known row via the index doesn't. Only engaged for the
+            // default sort/dir; any other combination falls back to OFFSET.
+            @RequestParam(required = false) Integer cursorId,
+            @RequestParam(required = false) String cursorPlacedAt,
+            @RequestParam(required = false) String cursorDir) {
+        boolean useCursor = cursorId != null && cursorPlacedAt != null
+                && "placedAt".equals(sort) && "desc".equalsIgnoreCase(dir);
+        if (useCursor) {
+            boolean forward = !"prev".equalsIgnoreCase(cursorDir);
+            return ResponseEntity.ok(orderService.listOrdersByCursor(
+                    q, page, pageSize, status, regionCode, from, to, minTotal, maxTotal,
+                    cursorId, cursorPlacedAt, forward));
+        }
         return ResponseEntity.ok(
                 orderService.listOrders(q, page, pageSize, sort, dir, status, regionCode, from, to, minTotal, maxTotal));
     }

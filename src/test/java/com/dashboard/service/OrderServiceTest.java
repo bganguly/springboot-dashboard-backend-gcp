@@ -181,6 +181,94 @@ class OrderServiceTest {
     }
 
     @Test
+    void listOrders_lastPage_usesReverseScanAndRestoresDescOrder() {
+        // total=45, pageSize=20 -> 3 pages, last page (page 3) holds 5 rows.
+        // The DB returns them oldest-first (ASC scan from the far end); the
+        // service must flip that back to newest-first before returning.
+        stubQueries(List.of(orderRow(2), orderRow(1)), List.of(), 45);
+
+        OrderListResult result = service.listOrders(
+                null, 3, 20, "placedAt", "desc", null, null, null, null, null, null);
+
+        var captor = ArgumentCaptor.forClass(String.class);
+        var paramsCaptor = ArgumentCaptor.forClass(SqlParameterSource.class);
+        verify(jdbc, atLeastOnce()).queryForList(captor.capture(), paramsCaptor.capture());
+        String dataSql = captor.getAllValues().stream()
+                .filter(sql -> sql.contains("FROM orders o"))
+                .findFirst().orElseThrow();
+        int idx = captor.getAllValues().indexOf(dataSql);
+        assertThat(dataSql).contains("ORDER BY o.\"placedAt\" ASC");
+        assertThat(paramsCaptor.getAllValues().get(idx).getValue("limit")).isEqualTo(5);
+        assertThat(paramsCaptor.getAllValues().get(idx).getValue("offset")).isEqualTo(0);
+
+        // Rows came back [id=2, id=1] (oldest-first); reversed -> [id=1, id=2].
+        assertThat(result.data()).extracting("id").containsExactly(1, 2);
+        assertThat(result.totalPages()).isEqualTo(3);
+    }
+
+    @Test
+    void listOrders_notLastPage_usesPlainOffset() {
+        stubQueries(List.of(orderRow(1)), List.of(), 45);
+
+        service.listOrders(null, 2, 20, "placedAt", "desc", null, null, null, null, null, null);
+
+        var captor = ArgumentCaptor.forClass(String.class);
+        var paramsCaptor = ArgumentCaptor.forClass(SqlParameterSource.class);
+        verify(jdbc, atLeastOnce()).queryForList(captor.capture(), paramsCaptor.capture());
+        String dataSql = captor.getAllValues().stream()
+                .filter(sql -> sql.contains("FROM orders o"))
+                .findFirst().orElseThrow();
+        int idx = captor.getAllValues().indexOf(dataSql);
+        assertThat(dataSql).contains("ORDER BY o.\"placedAt\" DESC");
+        assertThat(paramsCaptor.getAllValues().get(idx).getValue("limit")).isEqualTo(20);
+        assertThat(paramsCaptor.getAllValues().get(idx).getValue("offset")).isEqualTo(20);
+    }
+
+    @Test
+    void listOrdersByCursor_forward_seeksPastCursorDescending() {
+        stubQueries(List.of(orderRow(5)), List.of(), 100);
+
+        OrderListResult result = service.listOrdersByCursor(
+                null, 2, 20, null, null, null, null, null, null,
+                10, "2026-01-15T10:30:00.000Z", true);
+
+        var captor = ArgumentCaptor.forClass(String.class);
+        var paramsCaptor = ArgumentCaptor.forClass(SqlParameterSource.class);
+        verify(jdbc, atLeastOnce()).queryForList(captor.capture(), paramsCaptor.capture());
+        String dataSql = captor.getAllValues().stream()
+                .filter(sql -> sql.contains("FROM orders o"))
+                .findFirst().orElseThrow();
+        int idx = captor.getAllValues().indexOf(dataSql);
+        assertThat(dataSql)
+                .contains("(o.\"placedAt\", o.id) < (:cursorPlacedAt::timestamptz, :cursorId)")
+                .contains("ORDER BY o.\"placedAt\" DESC, o.id DESC");
+        assertThat(paramsCaptor.getAllValues().get(idx).getValue("cursorId")).isEqualTo(10);
+        assertThat(result.page()).isEqualTo(2);
+        assertThat(result.total()).isEqualTo(100);
+    }
+
+    @Test
+    void listOrdersByCursor_backward_seeksAndRestoresDescOrder() {
+        stubQueries(List.of(orderRow(1), orderRow(2)), List.of(), 100);
+
+        OrderListResult result = service.listOrdersByCursor(
+                null, 1, 20, null, null, null, null, null, null,
+                10, "2026-01-15T10:30:00.000Z", false);
+
+        var captor = ArgumentCaptor.forClass(String.class);
+        verify(jdbc, atLeastOnce()).queryForList(captor.capture(), any(SqlParameterSource.class));
+        String dataSql = captor.getAllValues().stream()
+                .filter(sql -> sql.contains("FROM orders o"))
+                .findFirst().orElseThrow();
+        assertThat(dataSql)
+                .contains("(o.\"placedAt\", o.id) > (:cursorPlacedAt::timestamptz, :cursorId)")
+                .contains("ORDER BY o.\"placedAt\" ASC, o.id ASC");
+
+        // DB returns oldest-first [id=1, id=2] for the ASC seek; reversed -> [id=2, id=1].
+        assertThat(result.data()).extracting("id").containsExactly(2, 1);
+    }
+
+    @Test
     void listOrders_countCacheHit_skipsCountQuery() {
         when(jdbc.queryForList(anyString(), any(SqlParameterSource.class), eq(Long.class)))
                 .thenReturn(List.of(42L));

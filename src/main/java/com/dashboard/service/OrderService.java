@@ -37,7 +37,6 @@ public class OrderService {
 
         pageSize = Math.min(Math.max(pageSize, 1), MAX_PAGE_SIZE);
         page = Math.max(page, 1);
-        int offset = (page - 1) * pageSize;
 
         String safeSort = Set.of("placedAt", "total", "status", "customer", "id").contains(sort) ? sort : "placedAt";
         String safeDir = "asc".equalsIgnoreCase(dir) ? "ASC" : "DESC";
@@ -52,8 +51,8 @@ public class OrderService {
         String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
         long total = cachedCount(countSql, params, cacheKey);
         boolean approximate = false;
+        int totalPages = (int) Math.ceil((double) total / pageSize);
 
-        // Data page
         String orderBy = switch (safeSort) {
             case "customer" -> "c.\"firstName\" " + safeDir + ", c.\"lastName\" " + safeDir + ", o.\"placedAt\" DESC";
             case "total"    -> "o.total " + safeDir + ", o.\"placedAt\" DESC";
@@ -61,6 +60,23 @@ public class OrderService {
             case "id"       -> "o.id " + safeDir;
             default         -> "o.\"placedAt\" " + safeDir;
         };
+
+        // The last page is exactly as expensive to reach via OFFSET as any other
+        // deep page (Postgres must sort/skip everything before it regardless of
+        // which end you're nominally "closer" to) — but scanning the SAME index
+        // from the opposite end with a small LIMIT and no OFFSET is just as cheap
+        // as page 1, so flip the sort and take the first N rows from that end
+        // instead, then reverse them back into normal display order.
+        boolean useReverseScan = totalPages > 1 && page == totalPages;
+        int limit = pageSize;
+        int offset = (page - 1) * pageSize;
+        String effectiveOrderBy = orderBy;
+        if (useReverseScan) {
+            limit = (int) (total - (long) (totalPages - 1) * pageSize);
+            offset = 0;
+            effectiveOrderBy = flipOrderByDirection(orderBy);
+        }
+
         String dataSql = ctePrefix + """
                 SELECT o.id, o.status, o.total, o.currency, o.notes, o."placedAt",
                        c.id AS c_id, c.email, c."firstName", c."lastName", c.phone,
@@ -69,22 +85,85 @@ public class OrderService {
                 JOIN customers c ON c.id = o."customerId"
                 JOIN regions r ON r.id = o."regionId"
                 """ + where +
-                " ORDER BY " + orderBy +
+                " ORDER BY " + effectiveOrderBy +
                 " LIMIT :limit OFFSET :offset";
-        params.addValue("limit", pageSize).addValue("offset", offset);
+        params.addValue("limit", limit).addValue("offset", offset);
 
         List<Map<String, Object>> rows = jdbc.queryForList(dataSql, params);
+        if (useReverseScan) rows = new ArrayList<>(rows).reversed();
 
+        return toResult(rows, page, pageSize, total, totalPages, approximate);
+    }
+
+    /**
+     * Cursor (keyset) fetch of the page immediately before/after the given
+     * anchor row, for the default placedAt/desc sort only — the one column
+     * with a dedicated index, and the app's actual default view. An OFFSET
+     * query's cost scales with how deep the requested page is; a keyset query
+     * seeks directly to the cursor via the index and reads forward/backward,
+     * so it's equally cheap at any depth. total/totalPages are recomputed via
+     * the same cached-count path (typically a cache hit, since the filter
+     * signature is unchanged from the page that produced this cursor) purely
+     * so the response shape matches listOrders' — the caller (which already
+     * knows the target page number locally) supplies `page` for display.
+     */
+    public OrderListResult listOrdersByCursor(
+            String q, int page, int pageSize,
+            String status, String regionCode,
+            String from, String to,
+            BigDecimal minTotal, BigDecimal maxTotal,
+            int cursorId, String cursorPlacedAt, boolean forward) {
+
+        pageSize = Math.min(Math.max(pageSize, 1), MAX_PAGE_SIZE);
+
+        var params = new MapSqlParameterSource();
+        var where = buildWhere(q, status, regionCode, from, to, minTotal, maxTotal, params);
+
+        boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
+        String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
+        String countSql = "SELECT COUNT(*) FROM orders o " + regionJoin + where;
+        String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
+        long total = cachedCount(countSql, params, cacheKey);
+        int totalPages = (int) Math.ceil((double) total / pageSize);
+
+        String cursorClause = forward
+                ? "(o.\"placedAt\", o.id) < (:cursorPlacedAt::timestamptz, :cursorId)"
+                : "(o.\"placedAt\", o.id) > (:cursorPlacedAt::timestamptz, :cursorId)";
+        params.addValue("cursorPlacedAt", cursorPlacedAt).addValue("cursorId", cursorId);
+        String combinedWhere = where.isEmpty() ? "WHERE " + cursorClause : where + " AND " + cursorClause;
+        String orderBy = forward ? "o.\"placedAt\" DESC, o.id DESC" : "o.\"placedAt\" ASC, o.id ASC";
+
+        String dataSql = """
+                SELECT o.id, o.status, o.total, o.currency, o.notes, o."placedAt",
+                       c.id AS c_id, c.email, c."firstName", c."lastName", c.phone,
+                       r.id AS r_id, r.code AS r_code, r.name AS r_name
+                FROM orders o
+                JOIN customers c ON c.id = o."customerId"
+                JOIN regions r ON r.id = o."regionId"
+                """ + combinedWhere +
+                " ORDER BY " + orderBy +
+                " LIMIT :limit";
+        params.addValue("limit", pageSize);
+
+        List<Map<String, Object>> rows = jdbc.queryForList(dataSql, params);
+        // A backward (prev) fetch reads oldest-first so it can seek off the
+        // cursor with a plain LIMIT — flip back to the newest-first order the
+        // UI expects everywhere else.
+        if (!forward) rows = new ArrayList<>(rows).reversed();
+
+        return toResult(rows, page, pageSize, total, totalPages, false);
+    }
+
+    private OrderListResult toResult(List<Map<String, Object>> rows, int page, int pageSize,
+                                      long total, int totalPages, boolean approximate) {
         if (rows.isEmpty()) {
-            return new OrderListResult(List.of(), page, pageSize, total,
-                    (int) Math.ceil((double) total / pageSize), approximate);
+            return new OrderListResult(List.of(), page, pageSize, total, totalPages, approximate);
         }
 
         List<Integer> orderIds = rows.stream()
                 .map(r -> ((Number) r.get("id")).intValue())
                 .toList();
 
-        // Fetch items for this page
         Map<Integer, List<OrderItemDTO>> itemsByOrder = fetchItems(orderIds);
 
         List<OrderDTO> data = rows.stream().map(r -> {
@@ -109,8 +188,11 @@ public class OrderService {
             );
         }).toList();
 
-        int totalPages = (int) Math.ceil((double) total / pageSize);
         return new OrderListResult(data, page, pageSize, total, totalPages, approximate);
+    }
+
+    private String flipOrderByDirection(String orderBy) {
+        return orderBy.replace(" DESC", "  ").replace(" ASC", " DESC").replace("  ", " ASC");
     }
 
     /**
