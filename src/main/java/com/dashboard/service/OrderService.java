@@ -117,9 +117,7 @@ public class OrderService {
 
         boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
         String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
-        String countSql = "SELECT COUNT(*) FROM orders o " + regionJoin + where;
-        String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
-        long total = cachedCount(countSql, params, cacheKey);
+        long total = exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
         int totalPages = (int) Math.ceil((double) total / pageSize);
 
         String cursorClause = forward
@@ -228,6 +226,7 @@ public class OrderService {
                 && (regionCode == null || regionCode.isBlank())
                 && minTotal == null && maxTotal == null;
         if (!pureDateRange) return null;
+        if (from == null || from.isBlank() || to == null || to.isBlank()) return null;
 
         var params = new MapSqlParameterSource().addValue("from", from).addValue("to", to);
         Long sum = jdbc.queryForObject(
