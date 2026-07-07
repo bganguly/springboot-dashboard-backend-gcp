@@ -211,6 +211,9 @@ public class OrderService {
      * a raw COUNT(*), which on a cache miss blocks the caller synchronously).
      * Any other filter combination falls back to the cached exact-count path.
      */
+    public static boolean isApproximateCount(long count) { return count == COUNT_SENTINEL; }
+    public static long adjustCount(long count) { return count == COUNT_SENTINEL ? COUNT_CAP : count; }
+
     private static boolean hasShortToken(String q) {
         if (q == null || q.isBlank()) return false;
         for (String t : q.strip().split("\\s+")) {

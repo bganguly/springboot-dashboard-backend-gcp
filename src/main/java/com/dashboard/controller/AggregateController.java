@@ -1,6 +1,7 @@
 package com.dashboard.controller;
 
 import com.dashboard.service.AggregateService;
+import com.dashboard.service.OrderService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -57,7 +58,11 @@ public class AggregateController {
 
         Map<String, Object> body = new HashMap<>();
         if (includeData) body.put("data", data);
-        if (includeTotal) body.put("totalOrders", totalOrders);
+        if (includeTotal) {
+            long raw = (Long) totalOrders;
+            body.put("totalOrders", OrderService.adjustCount(raw));
+            body.put("totalOrdersApproximate", OrderService.isApproximateCount(raw));
+        }
         return ResponseEntity.ok(body);
     }
 }
