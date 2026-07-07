@@ -323,6 +323,7 @@ public class OrderService {
         if (q != null && !q.isBlank()) {
             String[] tokens = q.strip().split("\\s+");
             for (int i = 0; i < tokens.length; i++) {
+                if (tokens[i].length() < 3) continue;
                 String key = "q" + i;
                 clauses.add("o.search_text ILIKE :" + key);
                 params.addValue(key, "%" + tokens[i] + "%");
