@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Single entry point: build the backend image, push it, and deploy via
+# Pulumi. One-shot by default — every value below is auto-detected/derived
+# with no confirmation prompt, matching the nextjs repos' deploy.sh scripts.
+# The only interactive stops left are genuine forks in the road: gcloud/ADC
+# login (no headless alternative exists) and the demo-scale reseed (a
+# long-running, deliberate decision, not a safe default).
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 ENV_FILE="$ROOT_DIR/.env.gcp"
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-ask() {
-  local label="$1" hint="$2" default="$3"
-  printf '\n  %s\n' "$label" >&2
-  [[ -n "$hint"    ]] && printf '  → %s\n' "$hint" >&2
-  [[ -n "$default" ]] && printf '  [detected: %s]\n' "$default" >&2
-  printf '  > ' >&2
-  read -r input
-  echo "${input:-$default}"
-}
 
 # ── gcloud install ────────────────────────────────────────────────────────────
 if ! command -v gcloud >/dev/null 2>&1; then
@@ -32,44 +28,38 @@ if ! command -v gcloud >/dev/null 2>&1; then
 fi
 
 # ── gcloud auth ───────────────────────────────────────────────────────────────
+# No local-mode fallback for a GCP deploy (unlike nextjs's AWS scripts) — the
+# login itself needs browser interaction either way, so trigger it directly
+# instead of asking permission to ask.
 ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1 || true)
 if [[ -z "$ACTIVE_ACCOUNT" ]]; then
-  printf '\nNot authenticated with gcloud. Log in now? [Y/n] '
-  read -r do_login
-  if [[ -z "$do_login" || "$do_login" =~ ^[Yy]$ ]]; then
-    gcloud auth login
-    ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1 || true)
-    [[ -n "$ACTIVE_ACCOUNT" ]] || { printf 'Login did not complete.\n' >&2; exit 1; }
-  else
-    printf 'Exiting. Run: gcloud auth login\n'; exit 1
-  fi
+  printf '\nNot authenticated with gcloud — logging in...\n'
+  gcloud auth login
+  ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1 || true)
+  [[ -n "$ACTIVE_ACCOUNT" ]] || { printf 'Login did not complete.\n' >&2; exit 1; }
 fi
 printf '\nAuthenticated as: %s\n' "$ACTIVE_ACCOUNT"
 
 # ── seed known values ─────────────────────────────────────────────────────────
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
-DETECTED_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
-DETECTED_PROJECT="${DETECTED_PROJECT:-${GCP_PROJECT:-}}"
-DETECTED_REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
-DETECTED_REGION="${DETECTED_REGION:-${GCP_REGION:-us-central1}}"
+_CONFIG_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
+GCP_PROJECT="${_CONFIG_PROJECT:-${GCP_PROJECT:-}}"
+[[ -n "$GCP_PROJECT" ]] || {
+  printf '\nNo GCP project detected.\n' >&2
+  printf 'Run: gcloud config set project <id>   (or set GCP_PROJECT in %s)\n' "$ENV_FILE" >&2
+  exit 1
+}
+
+_CONFIG_REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
+GCP_REGION="${_CONFIG_REGION:-${GCP_REGION:-us-central1}}"
+
 _GIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)
 _BUILD_TS=$(date +%Y%m%d%H%M%S)
-DETECTED_TAG="${_GIT_HASH:+${_GIT_HASH}-}${_BUILD_TS}"
+TAG="${_GIT_HASH:+${_GIT_HASH}-}${_BUILD_TS}"
 
-# ── project + region ──────────────────────────────────────────────────────────
 printf '\n=== deployment config ===\n'
-
-GCP_PROJECT=$(ask \
-  "GCP project ID" \
-  "https://console.cloud.google.com — top nav project selector, or: gcloud projects list" \
-  "$DETECTED_PROJECT")
-[[ -n "$GCP_PROJECT" ]] || { printf '\nProject ID is required.\n' >&2; exit 1; }
-
-GCP_REGION=$(ask \
-  "Region" \
-  "Common: us-central1, us-east1, europe-west1 — or: gcloud compute regions list" \
-  "$DETECTED_REGION")
+printf '  Project: %s\n  Region:  %s\n' "$GCP_PROJECT" "$GCP_REGION"
 
 # ── Artifact Registry API + repo ──────────────────────────────────────────────
 AR_STATE=$(gcloud services list \
@@ -78,68 +68,37 @@ AR_STATE=$(gcloud services list \
   --format="value(state)" 2>/dev/null || true)
 
 if [[ "$AR_STATE" != "ENABLED" ]]; then
-  printf '\n  Artifact Registry API is not enabled for project %s.\n' "$GCP_PROJECT"
-  printf '  Enable it now? [Y/n] '
-  read -r enable_ar
-  if [[ -z "$enable_ar" || "$enable_ar" =~ ^[Yy]$ ]]; then
-    gcloud services enable artifactregistry.googleapis.com --project="$GCP_PROJECT"
-    printf '  API enabled.\n'
-  else
-    printf '  Cannot deploy without Artifact Registry. Exiting.\n' >&2; exit 1
-  fi
+  printf '\n  Enabling Artifact Registry API for project %s...\n' "$GCP_PROJECT"
+  gcloud services enable artifactregistry.googleapis.com --project="$GCP_PROJECT"
 fi
 
-DETECTED_REGISTRY=$(gcloud artifacts repositories list \
+_LISTED_REGISTRY=$(gcloud artifacts repositories list \
   --project="$GCP_PROJECT" \
   --location="$GCP_REGION" \
   --format="value(name)" 2>/dev/null | head -1 || true)
-DETECTED_REGISTRY="${DETECTED_REGISTRY##*/}"
-DETECTED_REGISTRY="${DETECTED_REGISTRY:-${ARTIFACT_REGISTRY:-}}"
+_LISTED_REGISTRY="${_LISTED_REGISTRY##*/}"
+REGISTRY="${_LISTED_REGISTRY:-${ARTIFACT_REGISTRY:-${GCP_PROJECT}-gradle}}"
 
-REGISTRY=$(ask \
-  "Artifact Registry repo name" \
-  "https://console.cloud.google.com/artifacts?project=${GCP_PROJECT} — or: gcloud artifacts repositories list --project=${GCP_PROJECT} --location=${GCP_REGION}" \
-  "$DETECTED_REGISTRY")
-
-if [[ -z "$REGISTRY" ]]; then
-  printf '\n  No repo found. Create a new Docker repo? [Y/n] '
-  read -r create_repo
-  if [[ -z "$create_repo" || "$create_repo" =~ ^[Yy]$ ]]; then
-    printf '  Repo name: '
-    read -r REGISTRY
-    [[ -n "$REGISTRY" ]] || { printf 'Repo name required.\n' >&2; exit 1; }
-    gcloud artifacts repositories create "$REGISTRY" \
-      --repository-format=docker \
-      --location="$GCP_REGION" \
-      --project="$GCP_PROJECT"
-    printf '  Repo "%s" created in %s.\n' "$REGISTRY" "$GCP_REGION"
-  else
-    printf 'Artifact Registry repo is required.\n' >&2; exit 1
-  fi
+if ! gcloud artifacts repositories describe "$REGISTRY" \
+      --project="$GCP_PROJECT" --location="$GCP_REGION" >/dev/null 2>&1; then
+  printf '\n  No Artifact Registry repo found — creating "%s" in %s...\n' "$REGISTRY" "$GCP_REGION"
+  gcloud artifacts repositories create "$REGISTRY" \
+    --repository-format=docker \
+    --location="$GCP_REGION" \
+    --project="$GCP_PROJECT"
 fi
-
-# ── tag ───────────────────────────────────────────────────────────────────────
-TAG=$(ask "Image tag" "Leave blank to use the detected git hash" "$DETECTED_TAG")
 
 IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REGISTRY}/backend:${TAG}"
 
 # ── check infra ───────────────────────────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
-  printf '\n.env.gcp not found — infra may not be up.\n'
-  printf 'Run infra-up.sh first? [Y/n] '
-  read -r run_infra
-  if [[ -z "$run_infra" || "$run_infra" =~ ^[Yy]$ ]]; then
-    GCP_PROJECT="$GCP_PROJECT" GCP_REGION="$GCP_REGION" "$ROOT_DIR/scripts/infra-up.sh"
-    [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
-  fi
+  printf '\n.env.gcp not found — provisioning infra first...\n'
+  GCP_PROJECT="$GCP_PROJECT" GCP_REGION="$GCP_REGION" "$ROOT_DIR/scripts/infra-up.sh"
+  [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 fi
 
-# ── confirm ───────────────────────────────────────────────────────────────────
-printf '\nWill build and push:\n  %s\n' "$IMAGE"
-printf 'Then deploy to Cloud Run in %s.\n' "$GCP_REGION"
-printf '\nProceed? [Y/n] '
-read -r yn
-[[ -z "$yn" || "$yn" =~ ^[Yy]$ ]] || { printf 'Aborted.\n'; exit 0; }
+printf '\nBuilding and pushing:\n  %s\n' "$IMAGE"
+printf 'Then deploying to Cloud Run in %s.\n' "$GCP_REGION"
 
 # ── build & push ──────────────────────────────────────────────────────────────
 if docker info >/dev/null 2>&1; then
@@ -162,13 +121,8 @@ fi
 
 # ── application default credentials (required by Pulumi GCP provider) ─────────
 if ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
-  printf '\nApplication Default Credentials needed for the GCP provider. Set up now? [Y/n] '
-  read -r do_adc
-  if [[ -z "$do_adc" || "$do_adc" =~ ^[Yy]$ ]]; then
-    gcloud auth application-default login
-  else
-    printf 'Run: gcloud auth application-default login\n'; exit 1
-  fi
+  printf '\nSetting up Application Default Credentials (required by the Pulumi GCP provider)...\n'
+  gcloud auth application-default login
 fi
 
 # ── deploy via pulumi ─────────────────────────────────────────────────────────
@@ -189,6 +143,8 @@ BACKEND_URL=$(pulumi stack output backendUrl 2>/dev/null || \
 printf '\nDone. Backend URL:\n  %s\n' "$BACKEND_URL"
 
 # ── optional seed ─────────────────────────────────────────────────────────────
+# Genuine fork in the road (long-running, not a safe default) — kept
+# interactive, same as nextjs's demo-scale reseed prompt.
 _CUSTOMERS=$(curl -sf "${BACKEND_URL}/api/customers" --max-time 10 2>/dev/null \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',[])))" 2>/dev/null || echo "-1")
 

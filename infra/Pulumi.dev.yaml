@@ -1,6 +1,6 @@
 config:
   gcp:project: bikram-springboot
   gcp:region: us-central1
-  dashboard:backendImage: us-central1-docker.pkg.dev/bikram-springboot/bikram-springboot-gradle/backend:bb968f1-20260706163905
+  dashboard:backendImage: us-central1-docker.pkg.dev/bikram-springboot/bikram-springboot-gradle/backend:b2e2dfd-20260707063302
   dashboard:dbDiskGb: "35"
   dashboard:frontendImage: us-central1-docker.pkg.dev/bikram-springboot/dash-repo/frontend:norange-20260701021714
