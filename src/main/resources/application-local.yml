@@ -1,0 +1,4 @@
+# Local dev profile — activate with: SPRING_PROFILES_ACTIVE=local ./gradlew bootRun
+# Port 3007 avoids collision with portfolio dev (9090) and dashboard frontend (3006).
+server:
+  port: 3007
