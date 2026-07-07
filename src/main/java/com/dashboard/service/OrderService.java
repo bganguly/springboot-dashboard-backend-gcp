@@ -22,6 +22,11 @@ public class OrderService {
     private static final int DEFAULT_PAGE_SIZE = 20;
     private static final int MAX_PAGE_SIZE = 100;
     private static final DateTimeFormatter ISO = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+    private static final int COUNT_CAP = 10_000;
+    // Returned by exactCount when the result exceeds COUNT_CAP and the exact
+    // total wasn't computed. Callers check rawTotal == COUNT_SENTINEL to set
+    // approximate=true. Must not equal a plausible real order count near the cap.
+    private static final long COUNT_SENTINEL = (long) COUNT_CAP + 1;
 
     private final NamedParameterJdbcTemplate jdbc;
     private final OrderRepository orderRepository;
@@ -45,8 +50,9 @@ public class OrderService {
         String ctePrefix = buildSearchCte(q, params);
         var where = buildWhere(q, status, regionCode, from, to, minTotal, maxTotal, params);
 
-        long total = exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
-        boolean approximate = false;
+        long rawTotal = exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
+        boolean approximate = rawTotal == COUNT_SENTINEL;
+        long total = approximate ? COUNT_CAP : rawTotal;
         int totalPages = (int) Math.ceil((double) total / pageSize);
 
         String orderBy = switch (safeSort) {
@@ -117,7 +123,9 @@ public class OrderService {
 
         boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
         String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
-        long total = exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
+        long rawTotal = exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
+        boolean approximate = rawTotal == COUNT_SENTINEL;
+        long total = approximate ? COUNT_CAP : rawTotal;
         int totalPages = (int) Math.ceil((double) total / pageSize);
 
         String cursorClause = forward
@@ -145,7 +153,7 @@ public class OrderService {
         // UI expects everywhere else.
         if (!forward) rows = new ArrayList<>(rows).reversed();
 
-        return toResult(rows, page, pageSize, total, totalPages, false);
+        return toResult(rows, page, pageSize, total, totalPages, approximate);
     }
 
     private OrderListResult toResult(List<Map<String, Object>> rows, int page, int pageSize,
@@ -203,9 +211,62 @@ public class OrderService {
      * a raw COUNT(*), which on a cache miss blocks the caller synchronously).
      * Any other filter combination falls back to the cached exact-count path.
      */
+    private static boolean hasShortToken(String q) {
+        if (q == null || q.isBlank()) return false;
+        for (String t : q.strip().split("\\s+")) {
+            if (t.length() < 3) return true;
+        }
+        return false;
+    }
+
     public long exactCount(String q, String status, String regionCode,
                             String from, String to,
                             BigDecimal minTotal, BigDecimal maxTotal) {
+        Long rollup = tryDailyOrderCountRollup(q, status, regionCode, from, to, minTotal, maxTotal);
+        if (rollup != null) return rollup;
+
+        var params = new MapSqlParameterSource();
+        var where = buildWhere(q, status, regionCode, from, to, minTotal, maxTotal, params);
+        boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
+        String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
+        String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
+
+        if (hasShortToken(q)) {
+            // Check cache first — a prior /count call may have written the exact value
+            try {
+                List<Long> hit = jdbc.queryForList(
+                    "SELECT total FROM count_cache WHERE cache_key = :k AND cached_at > NOW() - INTERVAL '30 days'",
+                    new MapSqlParameterSource("k", cacheKey), Long.class);
+                if (!hit.isEmpty()) return hit.get(0);
+            } catch (Exception ignored) {}
+            // Cap the scan at COUNT_SENTINEL rows — if the subquery returns exactly
+            // COUNT_SENTINEL it means there are at least that many rows (exact unknown)
+            String cappedSql = "SELECT COUNT(*) FROM (SELECT 1 FROM orders o " + regionJoin + where +
+                               " LIMIT " + COUNT_SENTINEL + ") _cap";
+            long capped = Objects.requireNonNull(jdbc.queryForObject(cappedSql, params, Long.class));
+            // Only cache exact results (capped < sentinel) — sentinel stays uncached
+            // so a subsequent /count call can write the real value and heal the cache
+            if (capped < COUNT_SENTINEL) {
+                try {
+                    jdbc.update(
+                        "INSERT INTO count_cache (cache_key, total, cached_at) VALUES (:k, :t, NOW()) " +
+                        "ON CONFLICT (cache_key) DO UPDATE SET total = :t, cached_at = NOW()",
+                        new MapSqlParameterSource("k", cacheKey).addValue("t", capped));
+                } catch (Exception ignored) {}
+            }
+            return capped;
+        }
+
+        String countSql = "SELECT COUNT(*) FROM orders o " + regionJoin + where;
+        return cachedCount(countSql, params, cacheKey);
+    }
+
+    /** Uncapped exact count — used by GET /api/orders/count. Always writes the
+     *  real total to count_cache so subsequent exactCount calls get a cache hit
+     *  instead of re-running the capped subquery. */
+    public long exactCountUncapped(String q, String status, String regionCode,
+                                    String from, String to,
+                                    BigDecimal minTotal, BigDecimal maxTotal) {
         Long rollup = tryDailyOrderCountRollup(q, status, regionCode, from, to, minTotal, maxTotal);
         if (rollup != null) return rollup;
 
@@ -323,7 +384,6 @@ public class OrderService {
         if (q != null && !q.isBlank()) {
             String[] tokens = q.strip().split("\\s+");
             for (int i = 0; i < tokens.length; i++) {
-                if (tokens[i].length() < 3) continue;
                 String key = "q" + i;
                 clauses.add("o.search_text ILIKE :" + key);
                 params.addValue(key, "%" + tokens[i] + "%");

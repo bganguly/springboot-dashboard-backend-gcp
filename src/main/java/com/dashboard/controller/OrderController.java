@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/orders")
@@ -46,6 +47,25 @@ public class OrderController {
         }
         return ResponseEntity.ok(
                 orderService.listOrders(q, page, pageSize, sort, dir, status, regionCode, from, to, minTotal, maxTotal));
+    }
+
+    /** Exact (uncapped) count for the same filters as list. Intended as a
+     *  follow-up from the frontend when the main /api/orders response comes
+     *  back with approximate=true — fires in the background while the page
+     *  is already displayed, then updates the total once it resolves. Also
+     *  writes the real count to count_cache so subsequent list calls that
+     *  would otherwise re-run the capped subquery get a cache hit instead. */
+    @GetMapping("/count")
+    public ResponseEntity<?> count(
+            @RequestParam(required = false) String q,
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false) String regionCode,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) BigDecimal minTotal,
+            @RequestParam(required = false) BigDecimal maxTotal) {
+        long total = orderService.exactCountUncapped(q, status, regionCode, from, to, minTotal, maxTotal);
+        return ResponseEntity.ok(Map.of("total", total));
     }
 
     @PostMapping
