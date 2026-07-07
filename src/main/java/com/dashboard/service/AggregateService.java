@@ -17,14 +17,17 @@ public class AggregateService {
     private final OrderService orderService;
 
     /**
-     * Exact distinct order count for the same filters as getDailyAggregates —
-     * reuses /api/orders's identical cached exact-count path (same cache key),
-     * so the two numbers are byte-identical whenever they cover the same
-     * range/filters. This exists because the per-category rows above cannot be
-     * summed into a grand total: an order with items in two categories gets
-     * totalOrders=1 in EACH category's row (correct for the category
-     * breakdown), so summing across categories double-counts any order
-     * spanning more than one category.
+     * Exact distinct order count for the same filters as getDailyAggregates.
+     * This exists because the per-category rows above cannot be summed into a
+     * grand total: an order with items in two categories gets totalOrders=1
+     * in EACH category's row (correct for the category breakdown), so summing
+     * across categories double-counts any order spanning more than one
+     * category.
+     *
+     * Delegates to OrderService.exactCount so /api/aggregates's grand total
+     * and /api/orders's list total always agree and share the same
+     * daily_order_count-rollup-for-pure-date-range / cached-count-otherwise
+     * logic — see that method's javadoc for details.
      */
     public long getExactTotal(String from, String to, String q,
                                String status, String regionCode,

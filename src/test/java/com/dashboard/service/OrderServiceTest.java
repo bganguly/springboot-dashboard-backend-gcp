@@ -270,13 +270,17 @@ class OrderServiceTest {
 
     @Test
     void listOrders_countCacheHit_skipsCountQuery() {
+        // A search filter is required here so exactCount falls through to the
+        // cached-count path instead of the pure-date-range rollup (which
+        // bypasses count_cache entirely — see exactCount_pureDateRange_* in
+        // this class for that path's own coverage).
         when(jdbc.queryForList(anyString(), any(SqlParameterSource.class), eq(Long.class)))
                 .thenReturn(List.of(42L));
         when(jdbc.queryForList(anyString(), any(SqlParameterSource.class)))
                 .thenReturn(List.of());
 
         OrderListResult result = service.listOrders(
-                null, 1, 20, "placedAt", "desc", null, null, null, null, null, null);
+                "smith", 1, 20, "placedAt", "desc", null, null, null, null, null, null);
 
         assertThat(result.total()).isEqualTo(42);
         verify(jdbc, never()).queryForObject(anyString(), any(SqlParameterSource.class), eq(Long.class));
@@ -294,9 +298,39 @@ class OrderServiceTest {
                 .thenReturn(List.of());
 
         OrderListResult result = service.listOrders(
-                null, 1, 20, "placedAt", "desc", null, null, null, null, null, null);
+                "smith", 1, 20, "placedAt", "desc", null, null, null, null, null, null);
 
         assertThat(result.total()).isEqualTo(7);
+    }
+
+    @Test
+    void exactCount_pureDateRange_usesDailyOrderCountRollup() {
+        when(jdbc.queryForObject(anyString(), any(SqlParameterSource.class), eq(Long.class)))
+                .thenReturn(533038L);
+
+        long total = service.exactCount(null, null, null, "2026-06-05", "2026-06-08", null, null);
+
+        assertThat(total).isEqualTo(533038L);
+        var captor = ArgumentCaptor.forClass(String.class);
+        verify(jdbc).queryForObject(captor.capture(), any(SqlParameterSource.class), eq(Long.class));
+        assertThat(captor.getValue()).contains("FROM daily_order_count");
+        verify(jdbc, never()).queryForList(anyString(), any(SqlParameterSource.class), eq(Long.class));
+    }
+
+    @Test
+    void exactCount_withAnyFilter_fallsBackToCachedCount() {
+        when(jdbc.queryForList(anyString(), any(SqlParameterSource.class), eq(Long.class)))
+                .thenReturn(List.of());
+        when(jdbc.queryForObject(anyString(), any(SqlParameterSource.class), eq(Long.class)))
+                .thenReturn(42L);
+
+        long total = service.exactCount("smith", "PENDING", "US-E", "2026-06-05", "2026-06-08",
+                new BigDecimal("10"), new BigDecimal("500"));
+
+        assertThat(total).isEqualTo(42L);
+        var captor = ArgumentCaptor.forClass(String.class);
+        verify(jdbc).queryForObject(captor.capture(), any(SqlParameterSource.class), eq(Long.class));
+        assertThat(captor.getValue()).contains("FROM orders o").doesNotContain("daily_order_count");
     }
 
     @Test
@@ -333,6 +367,31 @@ class OrderServiceTest {
         assertThat(saved.getNotes()).isEqualTo("gift");
         assertThat(saved.getItems()).hasSize(2);
         assertThat(saved.getItems().get(1).getDiscount()).isEqualByComparingTo(BigDecimal.ZERO);
+    }
+
+    @Test
+    void createOrder_upsertsDailyOrderCountForTheOrdersDay() {
+        Customer customer = new Customer();
+        customer.setId(7);
+        Region region = new Region();
+        region.setId(3);
+        Product product = new Product();
+        product.setId(55);
+        when(customerRepository.findById(7)).thenReturn(Optional.of(customer));
+        when(regionRepository.findById(3)).thenReturn(Optional.of(region));
+        when(productRepository.findById(55)).thenReturn(Optional.of(product));
+        when(orderRepository.save(any(Order.class))).thenAnswer(inv -> {
+            Order o = inv.getArgument(0);
+            o.setId(99);
+            return o;
+        });
+
+        service.createOrder(new CreateOrderRequest(7, 3, null, null,
+                List.of(new CreateOrderRequest.Item(55, 1, BigDecimal.ONE, null))));
+
+        var captor = ArgumentCaptor.forClass(SqlParameterSource.class);
+        verify(jdbc).update(contains("INSERT INTO daily_order_count"), captor.capture());
+        assertThat(captor.getValue().getValue("date")).isEqualTo(java.time.LocalDate.now());
     }
 
     @Test

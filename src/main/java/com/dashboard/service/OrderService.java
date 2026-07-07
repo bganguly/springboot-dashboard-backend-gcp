@@ -45,11 +45,7 @@ public class OrderService {
         String ctePrefix = buildSearchCte(q, params);
         var where = buildWhere(q, status, regionCode, from, to, minTotal, maxTotal, params);
 
-        boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
-        String regionJoin = needsRegionJoin ? "JOIN regions r ON r.id = o.\"regionId\" " : "";
-        String countSql = ctePrefix + "SELECT COUNT(*) FROM orders o " + regionJoin + where;
-        String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
-        long total = cachedCount(countSql, params, cacheKey);
+        long total = exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
         boolean approximate = false;
         int totalPages = (int) Math.ceil((double) total / pageSize);
 
@@ -192,20 +188,29 @@ public class OrderService {
     }
 
     private String flipOrderByDirection(String orderBy) {
-        return orderBy.replace(" DESC", "  ").replace(" ASC", " DESC").replace("  ", " ASC");
+        return orderBy.replace(" DESC", "  ").replace(" ASC", " DESC").replace("  ", " ASC");
     }
 
     /**
-     * Exact distinct order count for the given filters — the same cached-count
-     * path listOrders uses for its own total, so /api/aggregates's grand total
+     * Exact distinct order count for the given filters — the same path
+     * listOrders uses for its own total, so /api/aggregates's grand total
      * (see AggregateService.getExactTotal) is guaranteed to agree with the
      * orders list whenever they cover the same range/filters. Summing the
      * per-category aggregate rows instead would double-count any order whose
      * items span more than one category.
+     *
+     * A pure date range (no q/status/region/total filter) sums
+     * daily_order_count instead — cheap regardless of range width, and never
+     * dependent on count_cache being pre-warmed for that exact range (unlike
+     * a raw COUNT(*), which on a cache miss blocks the caller synchronously).
+     * Any other filter combination falls back to the cached exact-count path.
      */
     public long exactCount(String q, String status, String regionCode,
                             String from, String to,
                             BigDecimal minTotal, BigDecimal maxTotal) {
+        Long rollup = tryDailyOrderCountRollup(q, status, regionCode, from, to, minTotal, maxTotal);
+        if (rollup != null) return rollup;
+
         var params = new MapSqlParameterSource();
         var where = buildWhere(q, status, regionCode, from, to, minTotal, maxTotal, params);
         boolean needsRegionJoin = regionCode != null && !regionCode.isBlank();
@@ -213,6 +218,22 @@ public class OrderService {
         String countSql = "SELECT COUNT(*) FROM orders o " + regionJoin + where;
         String cacheKey = buildCountCacheKey(q, status, regionCode, from, to, minTotal, maxTotal);
         return cachedCount(countSql, params, cacheKey);
+    }
+
+    private Long tryDailyOrderCountRollup(String q, String status, String regionCode,
+                                          String from, String to,
+                                          BigDecimal minTotal, BigDecimal maxTotal) {
+        boolean pureDateRange = (q == null || q.isBlank())
+                && (status == null || status.isBlank())
+                && (regionCode == null || regionCode.isBlank())
+                && minTotal == null && maxTotal == null;
+        if (!pureDateRange) return null;
+
+        var params = new MapSqlParameterSource().addValue("from", from).addValue("to", to);
+        Long sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(\"totalOrders\"), 0) FROM daily_order_count " +
+                "WHERE date BETWEEN :from::date AND :to::date", params, Long.class);
+        return sum != null ? sum : 0L;
     }
 
     @Transactional
@@ -251,6 +272,15 @@ public class OrderService {
         order.setTotal(total);
         order.setItems(items);
         Order saved = orderRepository.save(order);
+
+        // Same transaction as the order write, so this table is never even
+        // momentarily out of sync — a date-range total can be a cheap SUM
+        // over it (see AggregateService.getExactTotal) instead of a COUNT(*)
+        // scan over every matching order.
+        jdbc.update(
+                "INSERT INTO daily_order_count (date, \"totalOrders\") VALUES (:date, 1) " +
+                "ON CONFLICT (date) DO UPDATE SET \"totalOrders\" = daily_order_count.\"totalOrders\" + 1",
+                new MapSqlParameterSource("date", saved.getPlacedAt().toLocalDate()));
 
         // count_cache has no active invalidation otherwise (just a 30-day
         // passive TTL) — a new order makes every cached exact count a

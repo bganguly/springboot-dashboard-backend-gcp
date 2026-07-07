@@ -15,6 +15,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class AggregateServiceTest {
@@ -42,6 +43,20 @@ class AggregateServiceTest {
         var captor = ArgumentCaptor.forClass(String.class);
         verify(jdbc, atLeastOnce()).queryForList(captor.capture(), any(SqlParameterSource.class));
         return captor.getValue();
+    }
+
+    @Test
+    void getExactTotal_delegatesToOrderServiceExactCount() {
+        OrderService orderService = mock(OrderService.class);
+        when(orderService.exactCount("smith", "PENDING", "US-E", "2026-06-05", "2026-06-08",
+                new BigDecimal("10"), new BigDecimal("500"))).thenReturn(42L);
+        AggregateService svc = new AggregateService(jdbc, orderService);
+
+        long total = svc.getExactTotal("2026-06-05", "2026-06-08", "smith", "PENDING", "US-E",
+                new BigDecimal("10"), new BigDecimal("500"));
+
+        assertThat(total).isEqualTo(42L);
+        verify(jdbc, never()).queryForObject(anyString(), any(SqlParameterSource.class), eq(Long.class));
     }
 
     @Test

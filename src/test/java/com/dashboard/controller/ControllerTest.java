@@ -33,10 +33,39 @@ class ControllerTest {
                 .thenReturn(3L);
 
         var response = new AggregateController(service)
-                .get("2026-01-01", "2026-01-31", null, null, null, null, null, null);
+                .get("2026-01-01", "2026-01-31", null, null, null, null, null, null, true, true);
 
         assertThat(response.getStatusCode().value()).isEqualTo(200);
         assertThat(response.getBody()).isEqualTo(Map.of("data", List.of(dto), "totalOrders", 3L));
+    }
+
+    @Test
+    void aggregateController_includeTotalFalse_omitsTotalAndSkipsExactCount() {
+        AggregateService service = mock(AggregateService.class);
+        var dto = new DailyAggregateDTO("2026-01-01", Map.of());
+        when(service.getDailyAggregates("2026-01-01", "2026-01-31", null, null, null, null, null, null))
+                .thenReturn(List.of(dto));
+
+        var response = new AggregateController(service)
+                .get("2026-01-01", "2026-01-31", null, null, null, null, null, null, true, false);
+
+        assertThat(response.getBody()).isEqualTo(Map.of("data", List.of(dto)));
+        org.mockito.Mockito.verify(service, org.mockito.Mockito.never())
+                .getExactTotal(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void aggregateController_includeDataFalse_omitsDataAndSkipsAggregateQuery() {
+        AggregateService service = mock(AggregateService.class);
+        when(service.getExactTotal("2026-01-01", "2026-01-31", null, null, null, null, null))
+                .thenReturn(3L);
+
+        var response = new AggregateController(service)
+                .get("2026-01-01", "2026-01-31", null, null, null, null, null, null, false, true);
+
+        assertThat(response.getBody()).isEqualTo(Map.of("totalOrders", 3L));
+        org.mockito.Mockito.verify(service, org.mockito.Mockito.never())
+                .getDailyAggregates(any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
