@@ -1,6 +1,7 @@
 package com.dashboard.controller;
 
 import com.dashboard.service.AggregateService;
+import com.dashboard.service.AggregatesCache;
 import com.dashboard.service.OrderService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -9,6 +10,7 @@ import org.springframework.web.bind.annotation.*;
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
@@ -18,6 +20,7 @@ import java.util.concurrent.Executor;
 public class AggregateController {
 
     private final AggregateService aggregateService;
+    private final AggregatesCache aggregatesCache;
     private final Executor virtualThreadExecutor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
 
     @GetMapping
@@ -38,6 +41,16 @@ public class AggregateController {
             // — or vice versa — can request just one side.
             @RequestParam(defaultValue = "true") boolean includeData,
             @RequestParam(defaultValue = "true") boolean includeTotal) {
+        boolean noFilters = (q == null || q.isBlank()) && status == null && regionCode == null
+                && minTotal == null && maxTotal == null;
+        int effectiveTopN = topCategories != null ? topCategories : 5;
+        String cacheKey = (noFilters && includeData && includeTotal)
+                ? AggregatesCache.key(from, to, effectiveTopN) : null;
+        if (cacheKey != null) {
+            Optional<Map<String, Object>> hit = aggregatesCache.get(cacheKey);
+            if (hit.isPresent()) return ResponseEntity.ok(hit.get());
+        }
+
         CompletableFuture<?> dataFuture = includeData
                 ? CompletableFuture.supplyAsync(
                         () -> aggregateService.getDailyAggregates(from, to, q, status, regionCode, minTotal, maxTotal, topCategories),
@@ -63,6 +76,7 @@ public class AggregateController {
             body.put("totalOrders", OrderService.adjustCount(raw));
             body.put("totalOrdersApproximate", OrderService.isApproximateCount(raw));
         }
+        if (cacheKey != null) aggregatesCache.put(cacheKey, body);
         return ResponseEntity.ok(body);
     }
 }

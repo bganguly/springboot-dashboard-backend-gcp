@@ -32,7 +32,7 @@ public class AggregateService {
     public long getExactTotal(String from, String to, String q,
                                String status, String regionCode,
                                BigDecimal minTotal, BigDecimal maxTotal) {
-        return orderService.exactCount(q, status, regionCode, from, to, minTotal, maxTotal);
+        return orderService.exactCountUncapped(q, status, regionCode, from, to, minTotal, maxTotal);
     }
 
     public List<DailyAggregateDTO> getDailyAggregates(

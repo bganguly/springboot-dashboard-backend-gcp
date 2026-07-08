@@ -8,6 +8,8 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -33,6 +35,7 @@ public class OrderService {
     private final CustomerRepository customerRepository;
     private final RegionRepository regionRepository;
     private final ProductRepository productRepository;
+    private final AggregatesCache aggregatesCache;
 
     public OrderListResult listOrders(
             String q, int page, int pageSize, String sort, String dir,
@@ -364,6 +367,12 @@ public class OrderService {
                     "OR (:searchText IS NOT NULL AND :searchText ILIKE '%' || substring(cache_key from 'q=([^&]*)') || '%')",
                     new MapSqlParameterSource("searchText", searchText));
         } catch (Exception ignored) {}
+
+        // Evict the in-process aggregates cache after commit so the next
+        // chart request recomputes with the new order included.
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() { aggregatesCache.invalidateAll(); }
+        });
 
         return Map.of(
                 "id", saved.getId(),
