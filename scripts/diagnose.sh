@@ -32,5 +32,3 @@ for t in order_category_facts daily_customer_token_order_summary daily_filter_ca
   printf "  %-50s %s\n" "$t" "${exists:-MISSING}"
 done
 
-./scripts/free-port.sh 8080
-echo "=== App errors ===" && DATABASE_URL="$DB_URL" ./gradlew bootRun 2>&1 | grep -E "Caused by|APPLICATION FAILED|Started" | head -20
