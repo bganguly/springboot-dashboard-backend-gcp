@@ -4,7 +4,7 @@ Production-grade **Java 21 / Spring Boot 4** REST API delivering sub-second resp
 4 million orders: full-text trigram search, pre-aggregated analytics tables, serverless autoscaling,
 and declarative Pulumi IaC on GCP.
 
-Sister repo: [dashboard-frontend](https://github.com/bganguly/dashboard-frontend)
+Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-frontend-gcp)
 
 ---
 
@@ -38,29 +38,22 @@ Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──►
 
 ---
 
-## Local Dev
+## Running
 
-```bash
-./scripts/local-dev.sh
-```
+Both scripts prompt for **[1] Local** or **[2] Remote (GCP)** on launch.
 
-Checks prerequisites, creates and seeds the local database if needed, then starts on http://localhost:8080.
+| Action | Script | Prompt |
+|---|---|---|
+| Start local dev server | `./scripts/deploy.sh` | `[1]` |
+| Deploy to GCP (Cloud Run or GKE) | `./scripts/deploy.sh` | `[2]` |
+| Stop local dev server | `./scripts/infra-down.sh` | `[1]` |
+| Teardown GCP infrastructure | `./scripts/infra-down.sh` | `[2]` |
 
-Prerequisites checked automatically:
-- **Java 21** — via [SDKMAN](https://sdkman.io/) (avoids 30–60 min source build on older Macs with Homebrew)
-- **Gradle** — via SDKMAN
-- **PostgreSQL** — started via `brew services` if installed but not running
+Local prerequisites (checked automatically): **Java 21** and **Gradle** via [SDKMAN](https://sdkman.io/), **PostgreSQL 15** via Homebrew.
 
----
+> **GCP cost:** Cloud SQL, VPC connector, and the backend Cloud Run min-instance bill continuously while the stack is up. Run teardown when not actively demoing.
 
-## GCP Deploy
-
-```bash
-./scripts/deploy.sh
-```
-
-Detects GCP project, region, and Artifact Registry from `gcloud` config. Builds the Docker image,
-pushes to Artifact Registry, runs `pulumi up --yes`. Prints the Cloud Run URL on completion.
+> **GCP availability:** The live GCP endpoint is not guaranteed to be running at all times. Use local mode to explore without incurring cloud costs.
 
 ---
 
@@ -70,39 +63,17 @@ pushes to Artifact Registry, runs `pulumi up --yes`. Prints the Cloud Run URL on
 |---|---|
 | **Backend API** | https://dash-backend-7u2hpcwtmq-uc.a.run.app |
 
-### Quick test — local
-
 ```bash
+# local
 curl http://localhost:8080/actuator/health
 curl "http://localhost:8080/api/orders?page=1&size=3" | jq .total
 curl "http://localhost:8080/api/orders?q=sara+carter&page=1&size=3" | jq '.data[].customer'
-curl "http://localhost:8080/api/aggregates?from=2024-01-01&to=2024-12-31" | jq 'length'
-```
 
-### Quick test — deployed
-
-```bash
+# GCP (if deployed)
 BASE=https://dash-backend-7u2hpcwtmq-uc.a.run.app
 curl "$BASE/actuator/health"
 curl "$BASE/api/orders?page=1&size=3" | jq .total
-curl "$BASE/api/orders?q=sara+carter&page=1&size=3" | jq '.data[].customer'
-curl "$BASE/api/aggregates?from=2024-01-01&to=2024-12-31" | jq 'length'
 ```
-
----
-
-## Tear Down
-
-```bash
-./scripts/infra-down.sh
-```
-
-Runs `pulumi destroy --yes` then removes `.env.gcp`. Destroys all GCP resources — Cloud Run services,
-Cloud SQL instance, VPC, Secret Manager secrets, Artifact Registry, IAM bindings.
-
-> **Cost reminder:** Cloud SQL, the VPC connector, and the backend Cloud Run service (min 1 instance) all bill continuously while the stack is up. Tear down when not in use.
->
-> Cloud SQL disk cannot be shrunk once autoresized — teardown and recreate on next `infra-up`.
 
 ---
 
