@@ -482,9 +482,15 @@ PYAML
       --project "$GCP_PROJECT" --quiet 2>/dev/null || true
   done
 
+  _gke_target_network=$(gcloud compute networks list \
+    --project "$GCP_PROJECT" \
+    --filter="name=dash-vpc" \
+    --format="value(selfLink)" 2>/dev/null | head -1 || true)
+  [[ -z "$_gke_target_network" ]] && _gke_target_network="default"
+
   _create_gke_cluster() {
     _GKE_NET_ARGS=()
-    if gcloud compute networks describe dash-vpc --project "$GCP_PROJECT" >/dev/null 2>&1; then
+    if [[ "$_gke_target_network" != "default" ]]; then
       _GKE_NET_ARGS=(--network "dash-vpc" --subnetwork "dash-subnet")
     fi
     gcloud container clusters create "$GKE_CLUSTER" \
@@ -502,20 +508,11 @@ PYAML
     _CLUSTER_NET=$(gcloud container clusters describe "$GKE_CLUSTER" \
       --zone "$GKE_ZONE" --project "$GCP_PROJECT" \
       --format="value(networkConfig.network)" 2>/dev/null || true)
-    if [[ "$_CLUSTER_NET" != *"dash-vpc"* ]]; then
-      printf '\n  WARNING: cluster "%s" is on network "%s", not dash-vpc.\n' "$GKE_CLUSTER" "$_CLUSTER_NET"
-      printf '  Cloud SQL is private to dash-vpc — pods cannot reach it on this cluster.\n'
-      printf '  Delete and recreate on dash-vpc? [Y/n] '
-      read -r _RECREATE
-      if [[ -z "$_RECREATE" || "$_RECREATE" =~ ^[Yy]$ ]]; then
-        printf '  Deleting %s...\n' "$GKE_CLUSTER"
-        gcloud container clusters delete "$GKE_CLUSTER" \
-          --zone "$GKE_ZONE" --project "$GCP_PROJECT" --quiet
-        printf '  Creating %s on dash-vpc (this takes ~5 min)...\n' "$GKE_CLUSTER"
-        _create_gke_cluster
-      else
-        printf '  Skipping cluster recreation — deploy may fail if DB is unreachable.\n'
-      fi
+    if [[ "$_gke_target_network" != "default" && "$_CLUSTER_NET" != *"dash-vpc"* ]]; then
+      printf '\n  Cluster network mismatch detected — recreating %s (~5 min)...\n' "$GKE_CLUSTER"
+      gcloud container clusters delete "$GKE_CLUSTER" \
+        --zone "$GKE_ZONE" --project "$GCP_PROJECT" --quiet
+      _create_gke_cluster
     fi
   else
     printf '\n  Cluster not found — creating %s on dash-vpc (this takes ~5 min)...\n' "$GKE_CLUSTER"
