@@ -10,9 +10,13 @@ const region        = gcpConfig.get("region")       ?? "us-central1";
 const namePrefix    = config.get("namePrefix")       ?? "dash";
 const dbName        = config.get("dbName")           ?? "app";
 const dbUsername    = config.get("dbUsername")       ?? "appuser";
-const dbTier        = config.get("dbTier")           ?? "db-custom-4-16384";
-const dbDiskGb      = config.getNumber("dbDiskGb")   ?? 35;
-const backendImage  = config.get("backendImage")     ?? "";
+const dbTier           = config.get("dbTier")              ?? "db-custom-4-16384";
+const dbDiskGb         = config.getNumber("dbDiskGb")      ?? 35;
+const backendImage     = config.get("backendImage")        ?? "";
+const minInstanceCount = config.getNumber("minInstanceCount") ?? 1;
+const maxInstanceCount = config.getNumber("maxInstanceCount") ?? 5;
+const cpu              = config.get("cpu")                 ?? "2";
+const memory           = config.get("memory")              ?? "1Gi";
 
 // ── APIs ──────────────────────────────────────────────────────────────────────
 const apis = [
@@ -68,6 +72,15 @@ new gcp.compute.Firewall("allow-connector-to-sql", {
   network: network.id,
   direction: "INGRESS",
   sourceRanges: ["10.8.16.0/28"],
+  allows: [{ protocol: "tcp", ports: ["5432"] }],
+});
+
+// Allow GKE nodes and pods (any 10.x.x.x in the VPC) to reach Cloud SQL on 5432
+new gcp.compute.Firewall("allow-gke-to-sql", {
+  name: `${namePrefix}-allow-gke-sql`,
+  network: network.id,
+  direction: "INGRESS",
+  sourceRanges: ["10.0.0.0/8"],
   allows: [{ protocol: "tcp", ports: ["5432"] }],
 });
 
@@ -171,7 +184,7 @@ const backendService = new gcp.cloudrunv2.Service("backend", {
     containers: [{
       image: backendImage !== "" ? backendImage : "us-docker.pkg.dev/cloudrun/container/hello",
       ports: [{ containerPort: 8080 }],
-      resources: { limits: { cpu: "2", memory: "1Gi" } },
+      resources: { limits: { cpu, memory } },
       startupProbe: {
         tcpSocket: { port: 8080 },
         initialDelaySeconds: 10,
@@ -189,7 +202,7 @@ const backendService = new gcp.cloudrunv2.Service("backend", {
         },
       }],
     }],
-    scaling: { minInstanceCount: 1, maxInstanceCount: 5 },
+    scaling: { minInstanceCount, maxInstanceCount },
   },
   traffics: [{ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", percent: 100 }],
 }, { dependsOn: [registry] });
