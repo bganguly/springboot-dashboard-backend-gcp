@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dash-backend
+  namespace: dash
+  labels:
+    app: dash-backend
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 900
+  selector:
+    matchLabels:
+      app: dash-backend
+  template:
+    metadata:
+      labels:
+        app: dash-backend
+    spec:
+      # dash-backend-ksa must be bound to the GCP SA via Workload Identity (Terraform IaC)
+      serviceAccountName: dash-backend-ksa
+      containers:
+        - name: backend
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 60
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: dash-db-url
+                  key: url

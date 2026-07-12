@@ -1,0 +1,31 @@
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        gcloud container clusters get-credentials "$_CLUSTER" \
+          --zone "$_ZONE" --project "$PROJECT_ID"
+        kubectl apply -f namespace.yaml
+        kubectl create serviceaccount dash-backend-ksa -n "$_NAMESPACE" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        DB_URL=$$(gcloud secrets versions access latest \
+          --secret="dash-database-url" --project="$PROJECT_ID")
+        kubectl create secret generic dash-db-url \
+          --from-literal=url="$$DB_URL" \
+          -n "$_NAMESPACE" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        sed "s|IMAGE_PLACEHOLDER|$_IMAGE|g" deployment.yaml | kubectl apply -f -
+        kubectl apply -f service.yaml
+        kubectl apply -f hpa.yaml
+        kubectl apply -f ingress.yaml
+        kubectl rollout restart deployment/dash-backend -n "$_NAMESPACE"
+        kubectl rollout status deployment/dash-backend \
+          --namespace "$_NAMESPACE" --timeout=600s
+
+substitutions:
+  _IMAGE: ''
+  _CLUSTER: dash-gke-cluster
+  _ZONE: us-central1-a
+  _NAMESPACE: dash

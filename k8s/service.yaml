@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dash-backend
+  namespace: dash
+spec:
+  selector:
+    app: dash-backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
