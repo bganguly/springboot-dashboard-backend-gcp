@@ -22,8 +22,9 @@ steps:
         kubectl apply -f ingress.yaml
         kubectl rollout restart deployment/dash-backend -n "$_NAMESPACE"
         kubectl rollout status deployment/dash-backend \
-          --namespace "$_NAMESPACE" --timeout=600s
+          --namespace "$_NAMESPACE" --timeout=900s
 
+timeout: 1800s
 substitutions:
   _IMAGE: ''
   _CLUSTER: dash-gke-cluster
