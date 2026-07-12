@@ -378,6 +378,28 @@ PYEOF
         done <<< "$protected_urns"
         continue
       fi
+      if grep -qE 'Error waiting for Create Instance' "$log_file" 2>/dev/null; then
+        local _pending _wait_i=0
+        _pending=$(gcloud sql instances list \
+          --project "$GCP_PROJECT" \
+          --filter="state=PENDING_CREATE" \
+          --format="value(name)" 2>/dev/null || true)
+        if [[ -n "$_pending" ]]; then
+          printf '[deploy] Cloud SQL still creating (%s) — waiting for RUNNABLE (up to 15 min)...\n' "$_pending"
+          while (( _wait_i < 30 )); do
+            _wait_i=$(( _wait_i + 1 ))
+            sleep 30
+            _pending=$(gcloud sql instances list \
+              --project "$GCP_PROJECT" \
+              --filter="state=PENDING_CREATE" \
+              --format="value(name)" 2>/dev/null || true)
+            [[ -z "$_pending" ]] && break
+            printf '  still creating... (%d/30)\n' "$_wait_i"
+          done
+          printf '[deploy] Cloud SQL ready — retrying pulumi up...\n'
+          continue
+        fi
+      fi
       printf '\n[deploy] pulumi up failed — actual errors:\n' >&2
       grep -E 'error:|Error|failed|FAIL' "$log_file" | head -20 >&2 || true
       rm -f "$log_file"
