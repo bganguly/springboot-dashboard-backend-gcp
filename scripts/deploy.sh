@@ -354,6 +354,11 @@ for i, line in enumerate(lines):
         logical_name = m.group(2).strip()
         for j in range(i, min(i+8, len(lines))):
             id_m = re.search(r"'([^']+)' already exists", lines[j])
+            if not id_m:
+                # "failed to create instance <name>: ... already exists"
+                cm = re.search(r'failed to create \w+ ([^:\s]+):', lines[j])
+                if cm and re.search(r'already exists|instanceAlreadyExists', lines[j]):
+                    id_m = cm
             if id_m:
                 key = f'{type_display}|{logical_name}|{id_m.group(1)}'
                 if key not in seen:
