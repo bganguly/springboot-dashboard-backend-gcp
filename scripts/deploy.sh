@@ -593,17 +593,23 @@ EOF
   printf '\nDone. Backend URL:\n  %s\n' "$BACKEND_URL"
 fi
 
+if [[ "$DEPLOY_MODE" == "lite" ]]; then
+  DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo-lite.dump"
+else
+  DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo.dump"
+fi
+
 _DB_URL="$("$ROOT_DIR/scripts/database-url.sh" 2>/dev/null || true)"
 if [[ -n "$_DB_URL" ]]; then
   _TOKEN_ROWS=$(psql "$_DB_URL" -Atqc "SELECT count(*) FROM daily_customer_token_category_summary" 2>/dev/null || echo "0")
   if [[ "$_TOKEN_ROWS" == "0" ]]; then
     printf '\nDatabase needs seeding — running prepare-demo-data.sh (snapshot restore or full seed)...\n'
-    DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo.dump" \
+    DEMO_SNAPSHOT_GCS_URI="$DEMO_SNAPSHOT_GCS_URI" \
       DATABASE_URL="$_DB_URL" \
       "$ROOT_DIR/scripts/prepare-demo-data.sh"
 
     printf '\nRe-baking snapshot to GCS...\n'
-    DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo.dump" \
+    DEMO_SNAPSHOT_GCS_URI="$DEMO_SNAPSHOT_GCS_URI" \
       DATABASE_URL="$_DB_URL" \
       "$ROOT_DIR/scripts/bake-demo-snapshot.sh"
   else
