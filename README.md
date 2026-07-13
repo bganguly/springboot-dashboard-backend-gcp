@@ -12,8 +12,8 @@ Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-fron
 |---|---|
 | **Java / Spring Boot back-end** | Spring Boot 4, Java 21, NamedParameterJdbcTemplate, Flyway |
 | **PostgreSQL — SQL, DML/DDL, performance tuning** | Cloud SQL PG 16; Flyway DDL migrations; GIN trigram index; pre-aggregated summary tables for sub-second chart queries on 4 M rows |
-| **Serverless / cloud-native computing** | Cloud Run — fully serverless, scales to zero, no cluster management |
-| **IaC (Terraform equivalent)** | Pulumi TypeScript (`infra/index.ts`) — VPC, Cloud SQL, Cloud Run, IAM, Secret Manager, Artifact Registry all declared |
+| **Serverless / cloud-native computing** | Cloud Run — min-instances: 0, scales to zero, Direct VPC Egress to private Postgres |
+| **IaC (Terraform equivalent)** | Pulumi TypeScript (`infra/index.ts`) — VPC, GCE Postgres VM, Cloud Run service, IAM, Secret Manager, Artifact Registry all declared |
 | **CI/CD pipelines** | `deploy.sh` — build → push to Artifact Registry → `pulumi up --yes`; seed pipeline in `scripts/seed-via-proxy.sh` |
 | **Secrets management** | GCP Secret Manager; `DATABASE_URL` injected at runtime via `secretKeyRef`, never stored in image or env file |
 | **Networking, storage, DB architecture** | Private VPC, Direct VPC Egress, Private Service Connect for Cloud SQL, `db-custom-4-16384`, disk autoresize |
@@ -45,13 +45,45 @@ Both scripts prompt for **[1] Local** or **[2] Remote (GCP)** on launch.
 | Action | Script | Prompt |
 |---|---|---|
 | Start local dev server | `./scripts/deploy.sh` | `[1]` |
-| Deploy to GCP (Cloud Run or GKE) | `./scripts/deploy.sh` | `[2]` |
+| Deploy to GCP | `./scripts/deploy.sh` | `[2]` |
 | Stop local dev server | `./scripts/infra-down.sh` | `[1]` |
 | Teardown GCP infrastructure | `./scripts/infra-down.sh` | `[2]` |
 
 Local prerequisites (checked automatically): **Java 21** and **Gradle** via [SDKMAN](https://sdkman.io/), **PostgreSQL 15** via Homebrew.
 
 > **GCP cost:** Cloud SQL, VPC connector, and the backend Cloud Run min-instance bill continuously while the stack is up. Run teardown when not actively demoing.
+
+### Scheduled warm-instance window (8am–5pm Pacific)
+
+Two Cloud Scheduler jobs keep one backend instance warm during demo hours and scale it back to zero at 5pm, avoiding cold-start latency without paying for an always-on instance overnight.
+
+**Pause the schedule** (instance stays at whatever count it's currently at):
+
+```
+gcloud scheduler jobs pause dash-lite-scale-up-backend   --location us-central1 --project bikram-java
+gcloud scheduler jobs pause dash-lite-scale-down-backend --location us-central1 --project bikram-java
+```
+
+**Resume the schedule:**
+
+```
+gcloud scheduler jobs resume dash-lite-scale-up-backend   --location us-central1 --project bikram-java
+gcloud scheduler jobs resume dash-lite-scale-down-backend --location us-central1 --project bikram-java
+```
+
+**Force a warm instance right now** (without waiting for 8am):
+
+```
+gcloud scheduler jobs run dash-lite-scale-up-backend --location us-central1 --project bikram-java
+```
+
+**Force scale-to-zero right now:**
+
+```
+gcloud scheduler jobs run dash-lite-scale-down-backend --location us-central1 --project bikram-java
+```
+
+> Replace `dash-lite-` with `dash-full-` for the full-tier stack.
 
 > **GCP availability:** The live GCP endpoint is not guaranteed to be running at all times. Use local mode to explore without incurring cloud costs.
 
