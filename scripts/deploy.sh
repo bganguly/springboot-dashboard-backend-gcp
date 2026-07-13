@@ -893,6 +893,14 @@ fi
 printf '\nRemember to tear down when finished:\n'
 printf '  ./scripts/infra-down.sh\n'
 
+if [[ "$_TARGET" == "remote" && -n "$DEPLOY_MODE" ]]; then
+  _SET_LIVE="$(cd "$ROOT_DIR/../../portfolio/scripts" 2>/dev/null && pwd || true)/set-live-url.sh"
+  if [[ -f "$_SET_LIVE" ]]; then
+    printf '\nMarking dashboard backend live in portfolio...\n'
+    bash "$_SET_LIVE" --backend-only --tier "$DEPLOY_MODE" dashboard
+  fi
+fi
+
 FRONTEND_DEPLOY="$(cd "$ROOT_DIR/../dashboard-frontend-gcp/scripts" 2>/dev/null && pwd || true)/deploy.sh"
 if [[ -f "$FRONTEND_DEPLOY" ]]; then
   printf '\n  Deploying frontend inline...\n'
