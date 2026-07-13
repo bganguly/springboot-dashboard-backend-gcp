@@ -47,13 +47,11 @@ Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──►
 
 ### Scheduled warm-instance window (8am–5pm Pacific)
 
-One warm backend instance during demo hours; scales to zero overnight. `dash-lite-` → `dash-full-` for the full tier.
+One warm backend instance during demo hours; scales to zero overnight.
 
 ```bash
-gcloud scheduler jobs pause  dash-lite-scale-{up,down}-backend --location us-central1 --project bikram-java
-gcloud scheduler jobs resume dash-lite-scale-{up,down}-backend --location us-central1 --project bikram-java
-gcloud scheduler jobs run    dash-lite-scale-up-backend        --location us-central1 --project bikram-java
-gcloud scheduler jobs run    dash-lite-scale-down-backend      --location us-central1 --project bikram-java
+./scripts/scale.sh up|down|pause|resume   # default: TIER=lite
+TIER=full ./scripts/scale.sh up
 ```
 
 ---
