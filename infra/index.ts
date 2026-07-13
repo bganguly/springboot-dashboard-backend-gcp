@@ -10,7 +10,7 @@ const region        = gcpConfig.get("region")       ?? "us-central1";
 const namePrefix    = config.get("namePrefix")       ?? "dash";
 const dbName        = config.get("dbName")           ?? "app";
 const dbUsername    = config.get("dbUsername")       ?? "appuser";
-const dbTier           = config.get("dbTier")              ?? "db-custom-4-16384";
+const dbVmType         = config.get("dbVmType")            ?? "n2-standard-4";
 const dbDiskGb         = config.getNumber("dbDiskGb")      ?? 35;
 const backendImage     = config.get("backendImage")        ?? "";
 const minInstanceCount = config.getNumber("minInstanceCount") ?? 1;
@@ -75,7 +75,7 @@ new gcp.compute.Firewall("allow-connector-to-sql", {
   allows: [{ protocol: "tcp", ports: ["5432"] }],
 });
 
-// Allow GKE nodes and pods (any 10.x.x.x in the VPC) to reach Cloud SQL on 5432
+// Allow anything in VPC 10.x.x.x to reach Postgres VM on 5432
 new gcp.compute.Firewall("allow-gke-to-sql", {
   name: `${namePrefix}-allow-gke-sql`,
   network: network.id,
@@ -92,45 +92,63 @@ const connector = new gcp.vpcaccess.Connector("connector", {
   maxInstances: 3,
 }, { dependsOn: apis });
 
-// ── Cloud SQL ─────────────────────────────────────────────────────────────────
+// ── Postgres on GCE ───────────────────────────────────────────────────────────
 const dbPassword = new random.RandomPassword("db-password", {
   length: 24,
   special: false,
 });
 
-const dbInstance = new gcp.sql.DatabaseInstance("pg", {
-  name: `${namePrefix}-db`,
-  databaseVersion: "POSTGRES_16",
-  region,
-  settings: {
-    tier: dbTier,
-    diskSize: dbDiskGb,
-    diskAutoresize: true,
-    ipConfiguration: {
-      ipv4Enabled: false,
-      privateNetwork: network.id,
-      // Required for Cloud Run Direct VPC Egress to reach Cloud SQL private IP
-      enablePrivatePathForGoogleCloudServices: true,
+// Runs once at first boot (guarded by sentinel). Installs Postgres 16 + pg_bigm,
+// configures VPC-wide access, and creates the app user/db.
+const _startupScript = `#!/bin/bash
+set -euo pipefail
+SENTINEL=/var/lib/postgresql/.pg16_initialized
+[ -f "$SENTINEL" ] && exit 0
+_meta() { curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" -H Metadata-Flavor:Google; }
+DB_PASS=$(_meta db-password)
+DB_NAME=$(_meta db-name)
+DB_USER=$(_meta db-username)
+echo "deb http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
+DEBIAN_FRONTEND=noninteractive apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-server-dev-16 build-essential python3-pip
+python3 -m pip install pgxnclient --break-system-packages
+pgxn install pg_bigm
+sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/16/main/postgresql.conf
+echo "shared_preload_libraries = 'pg_bigm'" >> /etc/postgresql/16/main/postgresql.conf
+echo "host all all 10.0.0.0/8 scram-sha-256" >> /etc/postgresql/16/main/pg_hba.conf
+systemctl restart postgresql@16-main
+sleep 5
+sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';"
+sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
+sudo -u postgres psql -d $DB_NAME -c "CREATE EXTENSION IF NOT EXISTS pg_bigm;"
+touch "$SENTINEL"`;
+
+const dbVm = new gcp.compute.Instance("pg-vm", {
+  name: `${namePrefix}-pg`,
+  machineType: dbVmType,
+  zone: `${region}-a`,
+  bootDisk: {
+    initializeParams: {
+      image: "debian-cloud/debian-12",
+      size: dbDiskGb,
+      type: "pd-ssd",
     },
-    databaseFlags: [{ name: "max_connections", value: "200" }],
-    backupConfiguration: { enabled: true },
   },
-  deletionProtection: false,
-}, {
-  dependsOn: [privateVpc],
-  ignoreChanges: ["settings.diskSize"],  // diskAutoresize grows disk; never try to shrink
-});
+  networkInterfaces: [{
+    network: network.id,
+    subnetwork: subnet.id,
+  }],
+  metadata: {
+    "db-password": dbPassword.result,
+    "db-name": dbName,
+    "db-username": dbUsername,
+    "startup-script": _startupScript,
+  },
+  tags: [`${namePrefix}-pg`],
+}, { dependsOn: [privateVpc] });
 
-new gcp.sql.Database("app-db", {
-  name: dbName,
-  instance: dbInstance.name,
-});
-
-new gcp.sql.User("app-user", {
-  name: dbUsername,
-  instance: dbInstance.name,
-  password: dbPassword.result,
-});
+const dbVmIp = dbVm.networkInterfaces.apply(nics => nics[0].networkIp);
 
 // ── Secret Manager ────────────────────────────────────────────────────────────
 const dbUrlSecret = new gcp.secretmanager.Secret("database-url", {
@@ -140,7 +158,7 @@ const dbUrlSecret = new gcp.secretmanager.Secret("database-url", {
 
 const dbUrlSecretVersion = new gcp.secretmanager.SecretVersion("database-url-v1", {
   secret: dbUrlSecret.id,
-  secretData: pulumi.interpolate`postgresql://${dbUsername}:${dbPassword.result}@${dbInstance.privateIpAddress}:5432/${dbName}`,
+  secretData: pulumi.interpolate`postgresql://${dbUsername}:${dbPassword.result}@${dbVmIp}:5432/${dbName}`,
 }, { retainOnDelete: true });
 
 // ── Artifact Registry ─────────────────────────────────────────────────────────
@@ -159,12 +177,6 @@ const backendSa = new gcp.serviceaccount.Account("backend-sa", {
 new gcp.secretmanager.SecretIamMember("backend-db-url-access", {
   secretId: dbUrlSecret.id,
   role: "roles/secretmanager.secretAccessor",
-  member: pulumi.interpolate`serviceAccount:${backendSa.email}`,
-});
-
-new gcp.projects.IAMMember("backend-sql-access", {
-  project,
-  role: "roles/cloudsql.client",
   member: pulumi.interpolate`serviceAccount:${backendSa.email}`,
 });
 
@@ -216,9 +228,9 @@ new gcp.cloudrunv2.ServiceIamMember("backend-public", {
 });
 
 // ── Outputs ───────────────────────────────────────────────────────────────────
-export const cloudSqlInstance  = dbInstance.connectionName;
+export const dbVmInternalIp    = dbVmIp;
 export const artifactRegistry  = pulumi.interpolate`${region}-docker.pkg.dev/${project}/${registry.repositoryId}`;
 export const backendUrl        = backendService.uri;
 export const databaseUrl       = pulumi.secret(
-  pulumi.interpolate`postgresql://${dbUsername}:${dbPassword.result}@${dbInstance.privateIpAddress}:5432/${dbName}`
+  pulumi.interpolate`postgresql://${dbUsername}:${dbPassword.result}@${dbVmIp}:5432/${dbName}`
 );
