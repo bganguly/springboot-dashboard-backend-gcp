@@ -753,25 +753,7 @@ GCP_PROJECT=${GCP_PROJECT}
 GCP_REGION=${GCP_REGION}
 EOF
 
-  _BACKEND_UP=0
-  for _i in $(seq 1 36); do
-    _HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-      "${BACKEND_URL}/api/customers" --max-time 5 2>/dev/null || true)
-    if [[ "$_HTTP" == "200" ]]; then
-      _BACKEND_UP=1
-      break
-    fi
-    printf '  waiting for backend... (%d/36, HTTP %s)\n' "$_i" "${_HTTP:-000}"
-    sleep 10
-  done
-
-  if (( _BACKEND_UP )); then
-    printf '\nBackend is up: %s\n' "$BACKEND_URL"
-  else
-    printf '\nWARNING: Backend did not become healthy within 6 min — check logs:\n'
-    printf '  gcloud run services logs read %s-backend --region %s --project %s\n' \
-      "$DEPLOY_MODE_PREFIX" "$GCP_REGION" "$GCP_PROJECT"
-  fi
+  printf '\nBackend URL: %s\n' "$BACKEND_URL"
 
 if [[ "$DEPLOY_MODE" == "lite" ]]; then
   DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo-lite.dump"
@@ -790,19 +772,27 @@ else
 fi
 
 printf '\nChecking database...\n'
-_API_ORDERS=""
-for _i in 1 2 3 4 5; do
-  _API_ORDERS=$(curl -sf "${BACKEND_URL}/api/orders?page=0&size=1" 2>/dev/null \
-    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('total',0))" \
-    2>/dev/null || true)
-  [[ -n "$_API_ORDERS" ]] && break
-  printf '  waiting for backend (%d/5)...\n' "$_i"; sleep 10
-done
+_DB_ORDERS="0"
+if [[ "$_TARGET" == "remote" ]]; then
+  _DB_ORDERS=$(gcloud compute ssh "${_pg_vm}" \
+    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
+    --tunnel-through-iap --ssh-flag="-o ConnectTimeout=10" \
+    --command "sudo -u postgres psql -d app -t -c 'SELECT COUNT(*) FROM orders;' 2>/dev/null || echo 0" \
+    2>/dev/null | tr -d ' \n' || echo "0")
+  [[ "${_DB_ORDERS:-0}" =~ ^[0-9]+$ ]] || _DB_ORDERS="0"
+  printf '  DB row count (psql): %s\n' "$_DB_ORDERS"
+else
+  for _i in 1 2 3 4 5; do
+    _DB_ORDERS=$(curl -sf "${BACKEND_URL}/api/orders?page=0&size=1" 2>/dev/null \
+      | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('total',0))" \
+      2>/dev/null || echo "0")
+    [[ "${_DB_ORDERS:-0}" != "0" ]] && break
+    printf '  waiting for local backend (%d/5)...\n' "$_i"; sleep 10
+  done
+fi
 
-if [[ -z "$_API_ORDERS" ]]; then
-  printf '(Backend unreachable — skipping seed check)\n'
-elif [[ "$_API_ORDERS" != "0" ]]; then
-  printf 'Database has %s orders — skipping seed.\n' "$_API_ORDERS"
+if [[ "${_DB_ORDERS:-0}" -gt 0 ]]; then
+  printf 'Database has %s orders — skipping seed.\n' "$_DB_ORDERS"
 else
   printf 'Database empty — checking seed sources...\n'
   _SKIP_BAKE=0
@@ -1063,8 +1053,8 @@ if [[ "$_TARGET" == "remote" ]]; then
     && _chk 6 "GET /api/customers → 200" 1 \
     || _chk 6 "GET /api/customers → 200" 0 "HTTP $_HTTP6"
 
-  [[ "${_API_ORDERS:-0}" -gt 0 ]] \
-    && _chk 7 "Database has data" 1 "${_API_ORDERS} orders" \
+  [[ "${_DB_ORDERS:-0}" -gt 0 ]] \
+    && _chk 7 "Database has data" 1 "${_DB_ORDERS} orders" \
     || _chk 7 "Database has data" 0 "0 orders — seed may have failed"
 
   _CR_URL=$(gcloud run services describe "${DEPLOY_MODE_PREFIX}-frontend" \
