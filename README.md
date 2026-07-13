@@ -40,52 +40,21 @@ Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──►
 
 ## Running
 
-Both scripts prompt for **[1] Local** or **[2] Remote (GCP)** on launch.
-
-| Action | Script | Prompt |
-|---|---|---|
-| Start local dev server | `./scripts/deploy.sh` | `[1]` |
-| Deploy to GCP | `./scripts/deploy.sh` | `[2]` |
-| Stop local dev server | `./scripts/infra-down.sh` | `[1]` |
-| Teardown GCP infrastructure | `./scripts/infra-down.sh` | `[2]` |
-
-Local prerequisites (checked automatically): **Java 21** and **Gradle** via [SDKMAN](https://sdkman.io/), **PostgreSQL 15** via Homebrew.
-
-> **GCP cost:** Cloud SQL, VPC connector, and the backend Cloud Run min-instance bill continuously while the stack is up. Run teardown when not actively demoing.
+```bash
+./scripts/deploy.sh      # local [1] or GCP [2]
+./scripts/infra-down.sh  # stop local [1] or teardown GCP [2]
+```
 
 ### Scheduled warm-instance window (8am–5pm Pacific)
 
-Two Cloud Scheduler jobs keep one backend instance warm during demo hours and scale it back to zero at 5pm, avoiding cold-start latency without paying for an always-on instance overnight.
+One warm backend instance during demo hours; scales to zero overnight. `dash-lite-` → `dash-full-` for the full tier.
 
-**Pause the schedule** (instance stays at whatever count it's currently at):
-
+```bash
+gcloud scheduler jobs pause  dash-lite-scale-{up,down}-backend --location us-central1 --project bikram-java
+gcloud scheduler jobs resume dash-lite-scale-{up,down}-backend --location us-central1 --project bikram-java
+gcloud scheduler jobs run    dash-lite-scale-up-backend        --location us-central1 --project bikram-java
+gcloud scheduler jobs run    dash-lite-scale-down-backend      --location us-central1 --project bikram-java
 ```
-gcloud scheduler jobs pause dash-lite-scale-up-backend   --location us-central1 --project bikram-java
-gcloud scheduler jobs pause dash-lite-scale-down-backend --location us-central1 --project bikram-java
-```
-
-**Resume the schedule:**
-
-```
-gcloud scheduler jobs resume dash-lite-scale-up-backend   --location us-central1 --project bikram-java
-gcloud scheduler jobs resume dash-lite-scale-down-backend --location us-central1 --project bikram-java
-```
-
-**Force a warm instance right now** (without waiting for 8am):
-
-```
-gcloud scheduler jobs run dash-lite-scale-up-backend --location us-central1 --project bikram-java
-```
-
-**Force scale-to-zero right now:**
-
-```
-gcloud scheduler jobs run dash-lite-scale-down-backend --location us-central1 --project bikram-java
-```
-
-> Replace `dash-lite-` with `dash-full-` for the full-tier stack.
-
-> **GCP availability:** The live GCP endpoint is not guaranteed to be running at all times. Use local mode to explore without incurring cloud costs.
 
 ---
 
