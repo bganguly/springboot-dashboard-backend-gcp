@@ -11,12 +11,12 @@ Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-fron
 | | |
 |---|---|
 | **Java / Spring Boot back-end** | Spring Boot 4, Java 21, NamedParameterJdbcTemplate, Flyway |
-| **PostgreSQL — SQL, DML/DDL, performance tuning** | Cloud SQL PG 16; Flyway DDL migrations; GIN trigram index; pre-aggregated summary tables for sub-second chart queries on 4 M rows |
-| **Serverless / cloud-native computing** | Cloud Run — min-instances: 0, scales to zero, Direct VPC Egress to private Postgres |
+| **PostgreSQL — SQL, DML/DDL, performance tuning** | GCE VM Postgres 16; Flyway DDL migrations; GIN trigram index; pre-aggregated summary tables for sub-second chart queries on 4 M rows |
+| **Serverless / cloud-native computing** | Cloud Run (default) or GKE — min-instances: 0, scales to zero, Direct VPC Egress to private Postgres; toggled via `BACKEND_RUNTIME` |
 | **IaC (Terraform equivalent)** | Pulumi TypeScript (`infra/index.ts`) — VPC, GCE Postgres VM, Cloud Run service, IAM, Secret Manager, Artifact Registry all declared |
-| **CI/CD pipelines** | `deploy.sh` — build → push to Artifact Registry → `pulumi up --yes`; seed pipeline in `scripts/seed-via-proxy.sh` |
+| **CI/CD pipelines** | `deploy.sh` — build → push to Artifact Registry → `pulumi up --yes`; auto bake via ephemeral GCE VM when DB is empty |
 | **Secrets management** | GCP Secret Manager; `DATABASE_URL` injected at runtime via `secretKeyRef`, never stored in image or env file |
-| **Networking, storage, DB architecture** | Private VPC, Direct VPC Egress, Private Service Connect for Cloud SQL, `db-custom-4-16384`, disk autoresize |
+| **Networking, storage, DB architecture** | Private VPC, Direct VPC Egress, GCE VM Postgres on private IP (VPC firewall rules), pg-SSD boot disk |
 | **BFF / integration layer** | Nginx frontend proxies `/api/*` to Cloud Run backend (TLS + SNI); Spring Boot orchestrates REST + DB |
 | **RESTful APIs / microservices** | Two independent Cloud Run services; paginated list endpoint + aggregates endpoint |
 | **Performance optimization** | Sub-second ILIKE search on 4 M rows via GIN trigram index; pre-aggregated daily tables cut chart query time from seconds to milliseconds |
@@ -30,10 +30,10 @@ Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-fron
 > **4 M+ orders** in Cloud SQL PostgreSQL 16 — sub-second full-text search via GIN trigram index on a denormalized `search_text` column; millisecond chart aggregates via pre-aggregated summary tables; zero sequential scans on the hot path.
 
 ```
-Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──► Spring Boot / Cloud Run ──VPC──► Cloud SQL PG 16
-                   dash-frontend                             dash-backend                      dash-db
-                   0–3 instances                            1–5 instances                     4 M+ rows · GIN index
-                                    ▲─────────────── Pulumi TypeScript IaC ───────────────────▲
+Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──► Spring Boot (CR or GKE) ──VPC──► GCE VM: Postgres 16
+                   dash-frontend                             dash-backend                             dash-pg
+                   0–3 instances                            CR: 0–5 / GKE: 1 pod                    4 M+ rows · GIN index
+                                    ▲─────────────── Pulumi TypeScript IaC ──────────────────────────▲
 ```
 
 ---
@@ -65,7 +65,7 @@ TIER=full ./scripts/scale.sh up
 
 ```bash
 # local
-BASE=http://localhost:8080
+BASE=https://dash-lite-frontend-77y7e2wykq-uc.a.run.app
 curl "$BASE/actuator/health"
 curl "$BASE/api/orders?page=1&size=3" | jq .total
 curl "$BASE/api/orders?q=sara+carter&page=1&size=3" | jq '.data[].customer'
@@ -93,29 +93,26 @@ curl "$BASE/api/orders?page=1&size=3" | jq .total
 │   ┌───────────────────────────────────────────────────────────────┐     │
 │   │                       dash-vpc (private)                      │     │
 │   │                                                               │     │
-│   │  Cloud Run: dash-frontend          Cloud Run: dash-backend    │     │
-│   │  ┌─────────────────────────┐       ┌──────────────────────┐   │     │
-│   │  │ Nginx (port 80)         │       │ Spring Boot (8080)   │   │     │
-│   │  │ • serves Vite dist      │ HTTPS │ • REST /api/*        │   │     │
-│   │  │ • proxies /api/* ───────┼──────►│ • Flyway migrations  │   │     │
-│   │  │   proxy_ssl_server_name │  SNI  │ • NamedParameterJdbc │   │     │
-│   │  │   on (SNI required)     │       │ • 1–5 instances      │   │     │
-│   │  │ • 0–3 instances         │       └──────────┬───────────┘   │     │
-│   │  └─────────────────────────┘                  │               │     │
-│   │           ▲                          Direct VPC Egress        │     │
-│   │           │ HTTPS                    (private IP, no proxy)   │     │
-│   └───────────┼──────────────────────────────────┼───────────────┘     │
-│               │                                   │                     │
-│           Browser                    ┌────────────▼───────────┐        │
-│                                      │  Cloud SQL PG 16       │        │
-│                                      │  dash-db               │        │
-│                                      │  • orders (4 M rows)   │        │
-│                                      │  • GIN trigram index   │        │
-│                                      │    on search_text      │        │
-│                                      │  • pre-agg summary     │        │
-│                                      │    tables for charts   │        │
-│                                      │  • Flyway V1–V4        │        │
-│                                      └────────────────────────┘        │
+│   │  Cloud Run: dash-frontend      dash-backend (CR or GKE)      │     │
+│   │  ┌─────────────────────────┐   ┌────────────────────────┐    │     │
+│   │  │ Nginx (port 80)         │   │ Spring Boot (8080)     │    │     │
+│   │  │ • serves Vite dist      │ HTTPS • REST /api/*        │    │     │
+│   │  │ • proxies /api/* ───────┼──►│ • Flyway migrations   │    │     │
+│   │  │   proxy_ssl_server_name │SNI│ • NamedParameterJdbc  │    │     │
+│   │  │ • 0–3 instances         │   │ CR: 0–5 instances     │    │     │
+│   │  └─────────────────────────┘   │ GKE: 1 pod, e2-std-2  │    │     │
+│   │           ▲                    └──────────┬────────────┘    │     │
+│   │           │ HTTPS                Direct VPC Egress          │     │
+│   └───────────┼─────────────────────────────┼───────────────────┘     │
+│               │                             │                           │
+│           Browser              ┌────────────▼──────────┐               │
+│                                │  GCE VM: Postgres 16  │               │
+│                                │  dash-lite-pg         │               │
+│                                │  • orders (4 M rows)  │               │
+│                                │  • GIN trigram index  │               │
+│                                │  • pre-agg summary    │               │
+│                                │  • pg_bigm extension  │               │
+│                                └───────────────────────┘               │
 │                                                                         │
 │   Secret Manager                                                        │
 │   ┌──────────────────────┐                                              │
@@ -128,19 +125,22 @@ Deploy flow
 local machine
   └─ deploy.sh
        ├─ docker build + push → Artifact Registry
-       └─ pulumi up --yes
-            ├─ VPC / subnets / firewall
-            ├─ Cloud SQL instance + db + user
-            ├─ Secret Manager secret (DATABASE_URL)
-            ├─ Cloud Run backend (startup probe: 15 min for Flyway)
-            └─ Cloud Run frontend (BACKEND_URL env from backend URI)
+       ├─ pulumi up --yes
+       │    ├─ VPC / subnets / firewall
+       │    ├─ GCE VM (Postgres 16, startup script installs + configures)
+       │    ├─ Secret Manager secret (DATABASE_URL)
+       │    ├─ Cloud Run frontend (BACKEND_URL env pointing at backend)
+       │    └─ Cloud Run backend  [default]
+       │         or GKE cluster + Deployment  [BACKEND_RUNTIME=gke]
+       ├─ psql SSH row-count check → bake VM restore if DB empty
+       └─ frontend deploy (chained)
 
-Seed flow (one-time, 4 M orders from S3 dump)
-─────────────────────────────────────────────
-scripts/seed-via-proxy.sh
-  ├─ whitelist local public IP on Cloud SQL authorized networks
-  ├─ pg_restore directly on port 5432
-  └─ remove authorized network on exit (cleanup trap)
+Seed flow (bake VM, triggered when DB empty)
+────────────────────────────────────────────
+deploy.sh (auto) or scripts/bake-demo-snapshot.sh
+  ├─ create ephemeral n2-standard-8 bake VM on same VPC
+  ├─ gsutil cp gs://bikram-java-dash-snapshots/dash/demo-lite.dump → pg_restore
+  └─ delete bake VM on completion
 ```
 
 ### Key design decisions
