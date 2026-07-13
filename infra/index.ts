@@ -5,28 +5,21 @@ import * as random from "@pulumi/random";
 const config    = new pulumi.Config();
 const gcpConfig = new pulumi.Config("gcp");
 
-const project       = gcpConfig.require("project");
-const region        = gcpConfig.get("region")       ?? "us-central1";
-const namePrefix    = config.get("namePrefix")       ?? "dash";
-const dbName        = config.get("dbName")           ?? "app";
-const dbUsername    = config.get("dbUsername")       ?? "appuser";
-const dbVmType         = config.get("dbVmType")            ?? "n2-standard-4";
-const dbDiskGb         = config.getNumber("dbDiskGb")      ?? 35;
-const backendImage     = config.get("backendImage")        ?? "";
-const minInstanceCount = config.getNumber("minInstanceCount") ?? 1;
-const maxInstanceCount = config.getNumber("maxInstanceCount") ?? 5;
-const cpu              = config.get("cpu")                 ?? "2";
-const memory           = config.get("memory")              ?? "1Gi";
+const project        = gcpConfig.require("project");
+const region         = gcpConfig.get("region")         ?? "us-central1";
+const namePrefix     = config.get("namePrefix")         ?? "dash";
+const dbName         = config.get("dbName")             ?? "app";
+const dbUsername     = config.get("dbUsername")         ?? "appuser";
+const dbVmType       = config.get("dbVmType")           ?? "n2-standard-4";
+const dbDiskGb       = config.getNumber("dbDiskGb")     ?? 35;
+const backendImage   = config.get("backendImage")       ?? "";
+const backendVmType  = config.get("backendVmType")      ?? "e2-standard-2";
 
 // ── APIs ──────────────────────────────────────────────────────────────────────
 const apis = [
   "compute.googleapis.com",
-  "sqladmin.googleapis.com",
-  "run.googleapis.com",
   "artifactregistry.googleapis.com",
   "secretmanager.googleapis.com",
-  "vpcaccess.googleapis.com",
-  "servicenetworking.googleapis.com",
 ].map(api => new gcp.projects.Service(`api-${api.split(".")[0]}`, {
   project,
   service: api,
@@ -46,51 +39,24 @@ const subnet = new gcp.compute.Subnetwork("subnet", {
   network: network.id,
 });
 
-const connectorSubnet = new gcp.compute.Subnetwork("connector-subnet", {
-  name: `${namePrefix}-connector-subnet`,
-  ipCidrRange: "10.8.16.0/28",
-  region,
-  network: network.id,
-});
-
-const privateIpRange = new gcp.compute.GlobalAddress("sql-ip-range", {
-  name: `${namePrefix}-sql-ip-range`,
-  purpose: "VPC_PEERING",
-  addressType: "INTERNAL",
-  prefixLength: 20,
-  network: network.id,
-});
-
-const privateVpc = new gcp.servicenetworking.Connection("private-vpc", {
-  network: network.id,
-  service: "servicenetworking.googleapis.com",
-  reservedPeeringRanges: [privateIpRange.name],
-}, { dependsOn: apis });
-
-new gcp.compute.Firewall("allow-connector-to-sql", {
-  name: `${namePrefix}-allow-connector-sql`,
-  network: network.id,
-  direction: "INGRESS",
-  sourceRanges: ["10.8.16.0/28"],
-  allows: [{ protocol: "tcp", ports: ["5432"] }],
-});
-
-// Allow anything in VPC 10.x.x.x to reach Postgres VM on 5432
-new gcp.compute.Firewall("allow-gke-to-sql", {
-  name: `${namePrefix}-allow-gke-sql`,
+// Allow anything in VPC to reach Postgres on 5432
+new gcp.compute.Firewall("allow-internal-to-db", {
+  name: `${namePrefix}-allow-internal-db`,
   network: network.id,
   direction: "INGRESS",
   sourceRanges: ["10.0.0.0/8"],
   allows: [{ protocol: "tcp", ports: ["5432"] }],
 });
 
-const connector = new gcp.vpcaccess.Connector("connector", {
-  name: `${namePrefix}-connector`,
-  region,
-  subnet: { name: connectorSubnet.name },
-  minInstances: 2,
-  maxInstances: 3,
-}, { dependsOn: apis });
+// Allow public HTTP to backend VM on 8080
+new gcp.compute.Firewall("allow-http-backend", {
+  name: `${namePrefix}-allow-http-backend`,
+  network: network.id,
+  direction: "INGRESS",
+  targetTags: [`${namePrefix}-backend`],
+  sourceRanges: ["0.0.0.0/0"],
+  allows: [{ protocol: "tcp", ports: ["8080"] }],
+});
 
 // ── Postgres on GCE ───────────────────────────────────────────────────────────
 const dbPassword = new random.RandomPassword("db-password", {
@@ -146,7 +112,7 @@ const dbVm = new gcp.compute.Instance("pg-vm", {
     "startup-script": _startupScript,
   },
   tags: [`${namePrefix}-pg`],
-}, { dependsOn: [privateVpc] });
+});
 
 const dbVmIp = dbVm.networkInterfaces.apply(nics => nics[0].networkIp);
 
@@ -180,57 +146,80 @@ new gcp.secretmanager.SecretIamMember("backend-db-url-access", {
   member: pulumi.interpolate`serviceAccount:${backendSa.email}`,
 });
 
-// ── Cloud Run: Backend ────────────────────────────────────────────────────────
-const backendService = new gcp.cloudrunv2.Service("backend", {
-  name: `${namePrefix}-backend`,
+new gcp.artifactregistry.RepositoryIamMember("backend-ar-reader", {
   location: region,
-  template: {
-    serviceAccount: backendSa.email,
-    vpcAccess: {
-      networkInterfaces: [{
-        network: network.id,
-        subnetwork: subnet.id,
-      }],
-      egress: "PRIVATE_RANGES_ONLY",
-    },
-    containers: [{
-      image: backendImage !== "" ? backendImage : "us-docker.pkg.dev/cloudrun/container/hello",
-      ports: [{ containerPort: 8080 }],
-      resources: { limits: { cpu, memory } },
-      startupProbe: {
-        tcpSocket: { port: 8080 },
-        initialDelaySeconds: 10,
-        periodSeconds: 15,
-        failureThreshold: 60,  // 60 * 15s = 15 min — covers long Flyway migrations
-        timeoutSeconds: 5,
-      },
-      envs: [{
-        name: "DATABASE_URL",
-        valueSource: {
-          secretKeyRef: {
-            secret: dbUrlSecret.secretId,
-            version: dbUrlSecretVersion.version,
-          },
-        },
-      }],
-    }],
-    scaling: { minInstanceCount, maxInstanceCount },
-  },
-  traffics: [{ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", percent: 100 }],
-}, { dependsOn: [registry] });
-
-new gcp.cloudrunv2.ServiceIamMember("backend-public", {
-  project,
-  location: region,
-  name: backendService.name,
-  role: "roles/run.invoker",
-  member: "allUsers",
+  repository: registry.repositoryId,
+  role: "roles/artifactregistry.reader",
+  member: pulumi.interpolate`serviceAccount:${backendSa.email}`,
 });
 
+// ── Backend on GCE ────────────────────────────────────────────────────────────
+// Startup script: installs Docker + gcloud, pulls the image from Artifact Registry,
+// fetches DATABASE_URL from Secret Manager, and runs the container.
+// Runs on every boot so a VM reset picks up a new image tag.
+const _backendStartupScript = `#!/bin/bash
+set -euo pipefail
+_meta() { curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" -H Metadata-Flavor:Google; }
+BACKEND_IMAGE=$(_meta backend-image)
+DB_SECRET=$(_meta db-secret-name)
+PROJECT=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/project/project-id" -H Metadata-Flavor:Google)
+REGION="${region}"
+
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y docker.io
+  systemctl enable docker && systemctl start docker
+fi
+
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  apt-get update -qq && apt-get install -y google-cloud-cli
+fi
+
+gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+DATABASE_URL=$(gcloud secrets versions access latest --secret="$DB_SECRET" --project="$PROJECT")
+docker rm -f backend 2>/dev/null || true
+docker pull "$BACKEND_IMAGE"
+docker run -d --name backend --restart=unless-stopped -p 8080:8080 -e DATABASE_URL="$DATABASE_URL" "$BACKEND_IMAGE"`;
+
+const backendVm = new gcp.compute.Instance("backend-vm", {
+  name: `${namePrefix}-backend`,
+  machineType: backendVmType,
+  zone: `${region}-a`,
+  bootDisk: {
+    initializeParams: {
+      image: "debian-cloud/debian-12",
+      size: 20,
+      type: "pd-ssd",
+    },
+  },
+  networkInterfaces: [{
+    network: network.id,
+    subnetwork: subnet.id,
+    accessConfigs: [{}],
+  }],
+  serviceAccount: {
+    email: backendSa.email,
+    scopes: ["cloud-platform"],
+  },
+  metadata: {
+    "backend-image": backendImage !== "" ? backendImage : "gcr.io/cloudrun/hello",
+    "db-secret-name": `${namePrefix}-database-url`,
+    "startup-script": _backendStartupScript,
+  },
+  tags: [`${namePrefix}-backend`],
+}, { dependsOn: [dbUrlSecretVersion, registry] });
+
+const backendVmExternalIp = backendVm.networkInterfaces.apply(
+  nics => nics[0].accessConfigs![0].natIp!
+);
+
 // ── Outputs ───────────────────────────────────────────────────────────────────
-export const dbVmInternalIp    = dbVmIp;
-export const artifactRegistry  = pulumi.interpolate`${region}-docker.pkg.dev/${project}/${registry.repositoryId}`;
-export const backendUrl        = backendService.uri;
-export const databaseUrl       = pulumi.secret(
+export const dbVmInternalIp   = dbVmIp;
+export const artifactRegistry = pulumi.interpolate`${region}-docker.pkg.dev/${project}/${registry.repositoryId}`;
+export const backendUrl       = pulumi.interpolate`http://${backendVmExternalIp}:8080`;
+export const backendVmName    = pulumi.output(`${namePrefix}-backend`);
+export const databaseUrl      = pulumi.secret(
   pulumi.interpolate`postgresql://${dbUsername}:${dbPassword.result}@${dbVmIp}:5432/${dbName}`
 );

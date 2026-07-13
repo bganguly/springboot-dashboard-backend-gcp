@@ -505,12 +505,16 @@ PYEOF
     printf '[deploy] Auto-importing conflicting resources (attempt %d)...\n' "$attempt"
     while IFS='|' read -r type_display logical_name gcp_id; do
       [[ -z "$type_display" ]] && continue
-      local module type_name import_type
+      local module type_name import_type import_id
       module=$(printf '%s' "$type_display" | cut -d: -f2)
       type_name=$(printf '%s' "$type_display" | cut -d: -f3)
       import_type="gcp:${module}/${type_name,}:${type_name}"
-      printf '  importing: %s %s = %s\n' "$import_type" "$logical_name" "$gcp_id"
-      pulumi import "$import_type" "$logical_name" "$gcp_id" --yes 2>/dev/null || true
+      import_id="$gcp_id"
+      if [[ "$module" == "cloudrunv2" && "${type_name,,}" == "service" && "$import_id" != projects/* ]]; then
+        import_id="projects/${GCP_PROJECT}/locations/${GCP_REGION}/services/${import_id}"
+      fi
+      printf '  importing: %s %s = %s\n' "$import_type" "$logical_name" "$import_id"
+      pulumi import "$import_type" "$logical_name" "$import_id" --yes 2>/dev/null || true
     done <<< "$conflicts"
   done
 
@@ -540,10 +544,7 @@ config:
   dashboard:namePrefix: dash-lite
   dashboard:dbVmType: e2-standard-2
   dashboard:dbDiskGb: "20"
-  dashboard:minInstanceCount: "0"
-  dashboard:maxInstanceCount: "1"
-  dashboard:cpu: "1"
-  dashboard:memory: 512Mi
+  dashboard:backendVmType: e2-medium
   dashboard:backendImage: ${IMAGE}
 PYAML
     else
@@ -555,10 +556,7 @@ config:
   dashboard:namePrefix: dash
   dashboard:dbVmType: n2-standard-4
   dashboard:dbDiskGb: "35"
-  dashboard:minInstanceCount: "1"
-  dashboard:maxInstanceCount: "5"
-  dashboard:cpu: "2"
-  dashboard:memory: 1Gi
+  dashboard:backendVmType: e2-standard-2
   dashboard:backendImage: ${IMAGE}
 PYAML
     fi
@@ -664,6 +662,18 @@ else
   cd "$ROOT_DIR/infra"
   [[ -d node_modules ]] || npm install --prefer-offline 2>/dev/null || npm install
   pulumi stack select "$DEPLOY_MODE" 2>/dev/null || pulumi stack init "$DEPLOY_MODE"
+  DEPLOY_MODE_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash')
+
+  _LEGACY_CR="${DEPLOY_MODE_PREFIX}-backend"
+  _CR_EXISTS=$(gcloud run services describe "$_LEGACY_CR" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT" \
+    --format="value(name)" 2>/dev/null || true)
+  if [[ -n "$_CR_EXISTS" ]]; then
+    printf '  Deleting legacy Cloud Run service %s...\n' "$_LEGACY_CR"
+    gcloud run services delete "$_LEGACY_CR" \
+      --region "$GCP_REGION" --project "$GCP_PROJECT" --quiet
+  fi
+
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     cat > "Pulumi.${DEPLOY_MODE}.yaml" <<PYAML
 config:
@@ -672,10 +682,7 @@ config:
   dashboard:namePrefix: dash-lite
   dashboard:dbVmType: e2-standard-2
   dashboard:dbDiskGb: "20"
-  dashboard:minInstanceCount: "0"
-  dashboard:maxInstanceCount: "1"
-  dashboard:cpu: "1"
-  dashboard:memory: 512Mi
+  dashboard:backendVmType: e2-medium
   dashboard:backendImage: ${IMAGE}
 PYAML
   else
@@ -686,19 +693,22 @@ config:
   dashboard:namePrefix: dash
   dashboard:dbVmType: n2-standard-4
   dashboard:dbDiskGb: "35"
-  dashboard:minInstanceCount: "1"
-  dashboard:maxInstanceCount: "5"
-  dashboard:cpu: "2"
-  dashboard:memory: 1Gi
+  dashboard:backendVmType: e2-standard-2
   dashboard:backendImage: ${IMAGE}
 PYAML
   fi
   _pulumi_up_robust
 
+  printf '\n  Resetting backend VM to apply new image...\n'
+  gcloud compute instances reset "${DEPLOY_MODE_PREFIX}-backend" \
+    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet || true
+  printf '  VM reset — startup script will pull the image and start Spring Boot (~3-5 min).\n'
+
   BACKEND_URL=$(pulumi stack output backendUrl 2>/dev/null || \
-    gcloud run services describe dash-backend \
-      --region "$GCP_REGION" --project "$GCP_PROJECT" \
-      --format="value(status.url)" 2>/dev/null || true)
+    gcloud compute instances describe "${DEPLOY_MODE_PREFIX}-backend" \
+      --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
+      --format="value(networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null \
+      | awk '{print "http://" $1 ":8080"}' || true)
 
   cat > "$ENV_FILE" <<EOF
 DB_VM_IP=$(pulumi stack output dbVmInternalIp 2>/dev/null || true)
