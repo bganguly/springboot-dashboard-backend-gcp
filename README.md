@@ -60,17 +60,18 @@ TIER=full ./scripts/scale.sh up
 
 | | URL |
 |---|---|
-| **Backend API** | https://dash-backend-7u2hpcwtmq-uc.a.run.app |
+| **App** | https://dash-lite-frontend-77y7e2wykq-uc.a.run.app |
+| **Backend API (direct)** | https://dash-lite-backend-77y7e2wykq-uc.a.run.app |
 
 ```bash
 # local
-curl http://localhost:8080/actuator/health
-curl "http://localhost:8080/api/orders?page=1&size=3" | jq .total
-curl "http://localhost:8080/api/orders?q=sara+carter&page=1&size=3" | jq '.data[].customer'
-
-# GCP (if deployed)
-BASE=https://dash-backend-7u2hpcwtmq-uc.a.run.app
+BASE=http://localhost:8080
 curl "$BASE/actuator/health"
+curl "$BASE/api/orders?page=1&size=3" | jq .total
+curl "$BASE/api/orders?q=sara+carter&page=1&size=3" | jq '.data[].customer'
+
+# GCP — via frontend proxy (same as browser / API explorer)
+BASE=https://dash-lite-frontend-77y7e2wykq-uc.a.run.app
 curl "$BASE/api/orders?page=1&size=3" | jq .total
 ```
 

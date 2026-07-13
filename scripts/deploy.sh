@@ -969,18 +969,25 @@ EOF
 
   printf '\nBackend URL: %s\n' "$BACKEND_URL"
 
-  if [[ -n "$BACKEND_URL" ]]; then
-    python3 - "${ROOT_DIR}/README.md" "$BACKEND_URL" <<'PYEOF'
+  _FRONTEND_URL=$(gcloud run services describe "${DEPLOY_MODE_PREFIX}-frontend" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT" \
+    --format="value(status.url)" 2>/dev/null || true)
+
+  if [[ -n "$BACKEND_URL" || -n "$_FRONTEND_URL" ]]; then
+    python3 - "${ROOT_DIR}/README.md" "${BACKEND_URL:-}" "${_FRONTEND_URL:-}" <<'PYEOF'
 import re, sys
-path, url = sys.argv[1], sys.argv[2]
+path, backend, frontend = sys.argv[1], sys.argv[2], sys.argv[3]
 content = open(path).read()
-content = re.sub(r'(\| \*\*Backend API\*\* \| )https?://\S+( \|)', rf'\g<1>{url}\g<2>', content)
-content = re.sub(r'^BASE=https?://\S+', f'BASE={url}', content, flags=re.MULTILINE)
+if backend:
+    content = re.sub(r'(\| \*\*Backend API[^|]*\| )https?://\S+( \|)', rf'\g<1>{backend}\g<2>', content)
+if frontend:
+    content = re.sub(r'(\| \*\*App\*\* \| )https?://\S+( \|)', rf'\g<1>{frontend}\g<2>', content)
+    content = re.sub(r'^(BASE=https?://\S+)', f'BASE={frontend}', content, flags=re.MULTILINE)
 open(path, 'w').write(content)
 PYEOF
     if ! git -C "$ROOT_DIR" diff --quiet README.md 2>/dev/null; then
       git -C "$ROOT_DIR" add README.md
-      git -C "$ROOT_DIR" commit -m "update live backend URL: ${BACKEND_URL}"
+      git -C "$ROOT_DIR" commit -m "update live URLs: backend=${BACKEND_URL} frontend=${_FRONTEND_URL}"
       git -C "$ROOT_DIR" push origin main
     fi
   fi
