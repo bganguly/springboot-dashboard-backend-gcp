@@ -706,6 +706,11 @@ PYAML
   fi
   _pulumi_up_robust
 
+  printf '\n  Resetting DB VM (sentinel guards against re-init if already done)...\n'
+  gcloud compute instances reset "${DEPLOY_MODE_PREFIX}-pg" \
+    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet || true
+  printf '  DB VM reset — Postgres init takes ~3-5 min on first boot.\n'
+
   printf '\n  Resetting backend VM to apply new image...\n'
   gcloud compute instances reset "${DEPLOY_MODE_PREFIX}-backend" \
     --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet || true

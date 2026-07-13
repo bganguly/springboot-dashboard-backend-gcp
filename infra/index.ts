@@ -77,9 +77,12 @@ DB_USER=$(_meta db-username)
 echo "deb http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list
 curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
 DEBIAN_FRONTEND=noninteractive apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-server-dev-16 build-essential python3-pip
-python3 -m pip install pgxnclient --break-system-packages
-pgxn install pg_bigm
+DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-server-dev-16 build-essential git
+PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+git clone --depth 1 https://github.com/pgbigm/pg_bigm.git /tmp/pg_bigm
+make -C /tmp/pg_bigm USE_PGXS=1 PG_CONFIG="$PG_CONFIG"
+make -C /tmp/pg_bigm USE_PGXS=1 PG_CONFIG="$PG_CONFIG" install
+rm -rf /tmp/pg_bigm
 sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/16/main/postgresql.conf
 echo "shared_preload_libraries = 'pg_bigm'" >> /etc/postgresql/16/main/postgresql.conf
 echo "host all all 10.0.0.0/8 scram-sha-256" >> /etc/postgresql/16/main/pg_hba.conf
