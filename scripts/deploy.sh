@@ -62,9 +62,6 @@ if [[ "$_TARGET" == "remote" ]]; then
     printf '  GKE:        available (you will be prompted)\n'
     printf '  Cost est:   ~$200-300/mo if left running — TEAR DOWN when done\n'
   fi
-  printf '\nProceed? [Y/n] '
-  read -r _CONFIRM
-  [[ -z "$_CONFIRM" || "$_CONFIRM" =~ ^[Yy]$ ]] || { printf 'Aborted.\n'; exit 0; }
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
