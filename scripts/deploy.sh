@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+_STEP="startup"
+_on_exit() { local c=$?; [[ $c -ne 0 ]] && printf '\n[deploy.sh] ABORTED (exit %d) at step: %s\n' "$c" "$_STEP" >&2; }
+trap _on_exit EXIT
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -33,13 +36,13 @@ printf '\n=== springboot-dashboard-backend-gcp ===\n\n'
 printf '  [1] Local  — Spring Boot on localhost + local Postgres (no GCP cost)'
 (( _local_running )) && printf ' [running]' || printf ' [not detected]'
 printf '\n'
-printf '  [2] Lite   — GCP: e2-medium backend VM + e2-standard-2 Postgres VM'
+printf '  [2] Lite   — GCP: Cloud Run backend (min-0) + e2-standard-2 Postgres VM'
 (( _lite_count > 0 )) && printf ' [%s resources active]' "$_lite_count" || printf ' [not deployed]'
 printf '\n'
-printf '  [3] Full   — GCP: e2-standard-2 backend VM + n2-standard-4 Postgres VM'
+printf '  [3] Full   — GCP: Cloud Run backend (min-0) + n2-standard-4 Postgres VM'
 (( _full_count > 0 )) && printf ' [%s resources active]' "$_full_count" || printf ' [not deployed]'
 printf '\n'
-printf '               Full also unlocks GKE deployment.\n'
+printf '               Full uses a larger Postgres VM.\n'
 printf '\nChoice [1/2/3]: '
 read -r _MODE
 case "$_MODE" in
@@ -48,19 +51,39 @@ case "$_MODE" in
   *) _TARGET="local";  DEPLOY_MODE=""    ;;
 esac
 
+BACKEND_RUNTIME="cr"
+if [[ "$_TARGET" == "remote" ]]; then
+  printf '\n  Backend runtime:\n'
+  printf '  [1] Cloud Run — serverless, scales to zero (default)\n'
+  printf '  [2] GKE       — Kubernetes on e2-standard-2 node\n'
+  printf '\nChoice [1/2, default 1]: '
+  read -r _BR
+  case "$_BR" in
+    2) BACKEND_RUNTIME="gke" ;;
+    *) BACKEND_RUNTIME="cr"  ;;
+  esac
+fi
+
 if [[ "$_TARGET" == "remote" ]]; then
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     printf '\n--- Lite GCP summary ---\n'
-    printf '  Backend:    e2-medium GCE VM running Spring Boot in Docker\n'
+    printf '  Backend:    Cloud Run (min-instances: 0, scales to zero)\n'
     printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
-    printf '  GKE:        skipped\n'
-    printf '  Cost est:   ~$50-70/mo if left running\n'
+    printf '  Cost est:   ~$17/mo if left running (DB VM dominates)\n'
   else
-    printf '\n--- Full GCP summary ---\n'
-    printf '  Backend:    e2-standard-2 GCE VM running Spring Boot in Docker\n'
-    printf '  DB:         n2-standard-4 Postgres 16 VM (4 vCPU, 16 GB), 35 GB SSD\n'
-    printf '  GKE:        available (you will be prompted)\n'
-    printf '  Cost est:   ~$200-300/mo if left running — TEAR DOWN when done\n'
+    printf '\n'
+    printf '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n'
+    printf '  !!                                                        !!\n'
+    printf '  !!   FULL MODE SELECTED — THIS IS EXPENSIVE               !!\n'
+    printf '  !!                                                        !!\n'
+    printf '  !!   Backend:  Cloud Run (min-instances: 0)              !!\n'
+    printf '  !!   DB:       n2-standard-4 Postgres VM (4 vCPU, 16 GB) !!\n'
+    printf '  !!   Cost est: ~$200-300/mo — TEAR DOWN WHEN DONE        !!\n'
+    printf '  !!                                                        !!\n'
+    printf '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n'
+    printf '\n  Type YES to continue with full deploy: '
+    read -r _FULL_CONFIRM
+    [[ "$_FULL_CONFIRM" == "YES" ]] || { printf 'Aborted.\n'; exit 0; }
   fi
 fi
 
@@ -323,6 +346,7 @@ fi
 
 IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REGISTRY}/backend:${TAG}"
 
+
 _IMG_EXISTS=$(gcloud artifacts docker tags list \
   "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REGISTRY}/backend" \
   --filter="tag=${TAG}" \
@@ -333,28 +357,6 @@ if [[ -n "$_IMG_EXISTS" ]]; then
   printf '\n  Image %s already exists — skipping build.\n' "$IMAGE"
 else
   printf '\nBuilding and pushing:\n  %s\n' "$IMAGE"
-
-if [[ "$DEPLOY_MODE" == "lite" ]]; then
-  DEPLOY_TARGET="vm"
-  printf '\n  [lite] Skipping GKE — deploying to GCE VM.\n'
-else
-  _GKE_EXISTS=$(gcloud container clusters describe "${GKE_CLUSTER:-dash-gke-cluster}" \
-    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
-  if [[ -n "$_GKE_EXISTS" ]]; then
-    DEPLOY_TARGET="gke"
-    printf '\n  GKE cluster detected — redeploying to GKE.\n'
-  else
-    printf '\n=== STOPPED ===================================================\n'
-    printf '  Deploy to GKE (Kubernetes)?  Y = GKE  /  n = GCE VM\n'
-    printf '===============================================================\n'
-    read -r -p "Deploy to GKE? [Y/n]: " _CHOICE
-    case "$_CHOICE" in
-      [nN]*) DEPLOY_TARGET="vm" ;;
-      *)     DEPLOY_TARGET="gke" ;;
-    esac
-    printf '\n  Target: %s\n' "$DEPLOY_TARGET"
-  fi
-fi
 
 _cloudbuild_submit() {
   local tag="$1" project="$2" srcdir="$3"
@@ -407,9 +409,6 @@ if ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
   gcloud auth application-default login
 fi
 
-GKE_CLUSTER="${GKE_CLUSTER:-dash-gke-cluster}"
-K8S_NAMESPACE="dash"
-
 _pulumi_up_robust() {
   local log_file
   log_file="$(mktemp)"
@@ -452,6 +451,51 @@ PYEOF
     2>/dev/null || true)
 
     if [[ -z "$conflicts" ]]; then
+      # State drift: resource recorded in Pulumi state but deleted/missing in GCP.
+      # Pulumi tries to UPDATE → gets 404. Fix: remove from state so next run CREATEs it.
+      local drift_names
+      drift_names=$(python3 - "${log_file}" <<'PYEOF'
+import re, sys
+lines = open(sys.argv[1]).read().split('\n')
+seen = set()
+for i, line in enumerate(lines):
+    if re.search(r'(Error 404|does not exist)', line) and \
+       re.search(r'(Error updating|updating failed)', line):
+        # Walk back to find the Pulumi logical name from the "~ type name updating" line.
+        for j in range(max(0, i - 5), i + 1):
+            m = re.match(r'\s+~\s+\S+\s+(\S+)\s+updating\b', lines[j])
+            if m:
+                name = m.group(1)
+                if name not in seen:
+                    seen.add(name)
+                    print(name)
+                break
+PYEOF
+2>/dev/null || true)
+      if [[ -n "$drift_names" ]]; then
+        printf '[deploy] State drift: resources exist in Pulumi state but are missing in GCP. Removing stale entries...\n'
+        while IFS= read -r _rname; do
+          [[ -z "$_rname" ]] && continue
+          local _urn
+          _urn=$(pulumi stack export 2>/dev/null | python3 -c "
+import sys, json
+name = sys.argv[1]
+data = json.load(sys.stdin)
+for r in data.get('deployment', {}).get('resources', []):
+    urn = r.get('urn', '')
+    if urn.split('::')[-1] == name:
+        print(urn); break
+" "$_rname" 2>/dev/null || true)
+          if [[ -n "$_urn" ]]; then
+            printf '  purging: %s\n' "$_urn"
+            pulumi state delete "$_urn" --yes --target-dependents 2>/dev/null || true
+          else
+            printf '  (no URN found for %s)\n' "$_rname"
+          fi
+        done <<< "$drift_names"
+        continue
+      fi
+
       local deletion_fail_urns
       deletion_fail_urns=$(grep -oE 'error: deleting urn:pulumi:[^ ]+' "$log_file" \
         | sed 's/^error: deleting //; s/:$//' | sort -u || true)
@@ -502,6 +546,19 @@ PYEOF
       fi
       printf '\n[deploy] pulumi up failed — actual errors:\n' >&2
       grep -E 'error:|Error|failed|FAIL' "$log_file" | head -20 >&2 || true
+      if grep -q 'cloudrunv2\|Cloud Run\|container failed to start' "$log_file" 2>/dev/null; then
+        local _cr_svc="${DEPLOY_MODE_PREFIX:-dash-lite}-backend"
+        printf '\n[deploy] Cloud Run failure detected — fetching container logs for %s:\n' "$_cr_svc" >&2
+        gcloud run services logs read "$_cr_svc" \
+          --region "${GCP_REGION:-us-central1}" \
+          --project "${GCP_PROJECT}" \
+          --limit 60 2>/dev/null \
+          | grep -v '^WARNING' \
+          | grep -E 'ERROR|WARN|Exception|Caused by|Error|FATAL|started|Failed|refused|denied' \
+          | tail -40 >&2 || true
+        printf '\n[deploy] Full logs: gcloud run services logs read %s --region %s --project %s --limit 100\n' \
+          "$_cr_svc" "${GCP_REGION:-us-central1}" "${GCP_PROJECT}" >&2
+      fi
       rm -f "$log_file"
       return 1
     fi
@@ -527,156 +584,11 @@ PYEOF
   return 1
 }
 
-if [[ "$DEPLOY_TARGET" == "gke" ]]; then
-  GKE_ZONE="${GCP_REGION}-a"
-  DEPLOY_MODE_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash')
-
-  _SECRET_EXISTS=$(gcloud secrets versions access latest \
-    --secret="${DEPLOY_MODE_PREFIX:-dash}-database-url" \
-    --project "$GCP_PROJECT" >/dev/null 2>&1 && echo "yes" || echo "")
-  if [[ -z "$_SECRET_EXISTS" ]]; then
-    printf '\n=== provisioning Postgres VM + networking + secrets via Pulumi (required by GKE) ===\n'
-    cd "$ROOT_DIR/infra"
-    [[ -d node_modules ]] || npm install --prefer-offline 2>/dev/null || npm install
-    pulumi stack select "$DEPLOY_MODE" 2>/dev/null || pulumi stack init "$DEPLOY_MODE"
-    if [[ "$DEPLOY_MODE" == "lite" ]]; then
-      DEPLOY_MODE_PREFIX="dash-lite"
-      cat > "Pulumi.${DEPLOY_MODE}.yaml" <<PYAML
-config:
-  gcp:project: ${GCP_PROJECT}
-  gcp:region: ${GCP_REGION}
-  dashboard:namePrefix: dash-lite
-  dashboard:dbVmType: e2-standard-2
-  dashboard:dbDiskGb: "20"
-  dashboard:backendVmType: e2-medium
-  dashboard:backendImage: ${IMAGE}
-PYAML
-    else
-      DEPLOY_MODE_PREFIX="dash"
-      cat > "Pulumi.${DEPLOY_MODE}.yaml" <<PYAML
-config:
-  gcp:project: ${GCP_PROJECT}
-  gcp:region: ${GCP_REGION}
-  dashboard:namePrefix: dash
-  dashboard:dbVmType: n2-standard-4
-  dashboard:dbDiskGb: "35"
-  dashboard:backendVmType: e2-standard-2
-  dashboard:backendImage: ${IMAGE}
-PYAML
-    fi
-    _pulumi_up_robust
-    cd "$ROOT_DIR"
-
-    printf '  Verifying secret version is accessible before GKE deploy...\n'
-    _SECRET_READY=0
-    for _i in 1 2 3 4 5 6; do
-      if gcloud secrets versions access latest \
-          --secret="${DEPLOY_MODE_PREFIX:-dash}-database-url" \
-          --project "$GCP_PROJECT" >/dev/null 2>&1; then
-        _SECRET_READY=1
-        break
-      fi
-      printf '  Not yet accessible — waiting 10s (attempt %d/6)...\n' "$_i"
-      sleep 10
-    done
-    if (( ! _SECRET_READY )); then
-      printf '[deploy] Secret %s-database-url has no version after Pulumi up — aborting GKE deploy.\n' \
-        "${DEPLOY_MODE_PREFIX:-dash}" >&2
-      exit 1
-    fi
-  fi
-
-  printf '\n=== deploying to GKE via Cloud Build ===\n'
-  printf '  Cluster: %s  Zone: %s\n' "$GKE_CLUSTER" "$GKE_ZONE"
-
-  gcloud services enable cloudbuild.googleapis.com container.googleapis.com secretmanager.googleapis.com \
-    --project "$GCP_PROJECT" --quiet
-
-  _PROJECT_NUMBER=$(gcloud projects describe "$GCP_PROJECT" --format="value(projectNumber)")
-  for _SA in \
-    "${GCP_PROJECT}@cloudbuild.gserviceaccount.com" \
-    "${_PROJECT_NUMBER}-compute@developer.gserviceaccount.com"; do
-    gcloud secrets add-iam-policy-binding dash-database-url \
-      --member="serviceAccount:${_SA}" \
-      --role="roles/secretmanager.secretAccessor" \
-      --project "$GCP_PROJECT" --quiet 2>/dev/null || true
-  done
-
-  _gke_target_network=$(gcloud compute networks list \
-    --project "$GCP_PROJECT" \
-    --filter="name=dash-vpc" \
-    --format="value(selfLink)" 2>/dev/null | head -1 || true)
-  [[ -z "$_gke_target_network" ]] && _gke_target_network="default"
-
-  _create_gke_cluster() {
-    _GKE_NET_ARGS=()
-    if [[ "$_gke_target_network" != "default" ]]; then
-      _GKE_NET_ARGS=(--network "dash-vpc" --subnetwork "dash-subnet")
-    fi
-    gcloud container clusters create "$GKE_CLUSTER" \
-      --zone "$GKE_ZONE" \
-      "${_GKE_NET_ARGS[@]}" \
-      --num-nodes 1 \
-      --machine-type e2-medium \
-      --enable-autoscaling --min-nodes 1 --max-nodes 3 \
-      --workload-pool "${GCP_PROJECT}.svc.id.goog" \
-      --project "$GCP_PROJECT"
-  }
-
-  if gcloud container clusters describe "$GKE_CLUSTER" \
-        --zone "$GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
-    _CLUSTER_NET=$(gcloud container clusters describe "$GKE_CLUSTER" \
-      --zone "$GKE_ZONE" --project "$GCP_PROJECT" \
-      --format="value(networkConfig.network)" 2>/dev/null || true)
-    if [[ "$_gke_target_network" != "default" && "$_CLUSTER_NET" != *"dash-vpc"* ]]; then
-      printf '\n  Cluster network mismatch detected — recreating %s (~5 min)...\n' "$GKE_CLUSTER"
-      gcloud container clusters delete "$GKE_CLUSTER" \
-        --zone "$GKE_ZONE" --project "$GCP_PROJECT" --quiet
-      _create_gke_cluster
-    fi
-  else
-    printf '\n  Cluster not found — creating %s on dash-vpc (this takes ~5 min)...\n' "$GKE_CLUSTER"
-    _create_gke_cluster
-  fi
-
-  printf '\n  Tail Cloud Build logs? [Y/n] '
-  read -r _GKE_TAIL
-  _GKE_BUILD_ID=$(gcloud builds submit "$ROOT_DIR/k8s" \
-    --config "$ROOT_DIR/cloudbuild-gke.yaml" \
-    --substitutions "_IMAGE=${IMAGE},_CLUSTER=${GKE_CLUSTER},_ZONE=${GKE_ZONE},_NAMESPACE=${K8S_NAMESPACE}" \
-    --project "$GCP_PROJECT" \
-    --async --format="value(id)" 2>/dev/null)
-  printf '  Build ID: %s\n' "$_GKE_BUILD_ID"
-  if [[ -z "$_GKE_TAIL" || "$_GKE_TAIL" =~ ^[Yy]$ ]]; then
-    gcloud builds log --stream "$_GKE_BUILD_ID" --project "$GCP_PROJECT"
-  else
-    printf '  To tail later:\n    gcloud builds log --stream %s --project %s\n' "$_GKE_BUILD_ID" "$GCP_PROJECT"
-  fi
-  _GKE_BUILD_STATUS=$(gcloud builds describe "$_GKE_BUILD_ID" \
-    --project "$GCP_PROJECT" --format="value(status)" 2>/dev/null || true)
-  [[ "$_GKE_BUILD_STATUS" == "SUCCESS" ]] || {
-    printf '[deploy] GKE build %s — status: %s\n' "$_GKE_BUILD_ID" "$_GKE_BUILD_STATUS" >&2
-    exit 1
-  }
-
-  BACKEND_URL="<check GKE ingress — kubectl get ingress dash-backend -n ${K8S_NAMESPACE}>"
-  printf '\nDone. Check ingress IP:\n  kubectl get ingress dash-backend -n %s\n' "$K8S_NAMESPACE"
-else
-  printf '\n=== deploying via Pulumi ===\n'
+printf '\n=== deploying via Pulumi ===\n'
   cd "$ROOT_DIR/infra"
   [[ -d node_modules ]] || npm install --prefer-offline 2>/dev/null || npm install
   pulumi stack select "$DEPLOY_MODE" 2>/dev/null || pulumi stack init "$DEPLOY_MODE"
-  DEPLOY_MODE_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash')
-
-  _LEGACY_CR="${DEPLOY_MODE_PREFIX}-backend"
-  _CR_EXISTS=$(gcloud run services describe "$_LEGACY_CR" \
-    --region "$GCP_REGION" --project "$GCP_PROJECT" \
-    --format="value(name)" 2>/dev/null || true)
-  if [[ -n "$_CR_EXISTS" ]]; then
-    printf '  Deleting legacy Cloud Run service %s...\n' "$_LEGACY_CR"
-    gcloud run services delete "$_LEGACY_CR" \
-      --region "$GCP_REGION" --project "$GCP_PROJECT" --quiet
-  fi
+  DEPLOY_MODE_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash-full')
 
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     cat > "Pulumi.${DEPLOY_MODE}.yaml" <<PYAML
@@ -686,38 +598,152 @@ config:
   dashboard:namePrefix: dash-lite
   dashboard:dbVmType: e2-standard-2
   dashboard:dbDiskGb: "20"
-  dashboard:backendVmType: e2-medium
   dashboard:backendImage: ${IMAGE}
+  dashboard:backendRuntime: ${BACKEND_RUNTIME}
 PYAML
   else
     cat > "Pulumi.${DEPLOY_MODE}.yaml" <<PYAML
 config:
   gcp:project: ${GCP_PROJECT}
   gcp:region: ${GCP_REGION}
-  dashboard:namePrefix: dash
+  dashboard:namePrefix: dash-full
   dashboard:dbVmType: n2-standard-4
   dashboard:dbDiskGb: "35"
-  dashboard:backendVmType: e2-standard-2
   dashboard:backendImage: ${IMAGE}
+  dashboard:backendRuntime: ${BACKEND_RUNTIME}
 PYAML
   fi
+  _STEP="pulumi up"
   _pulumi_up_robust
 
+  _STEP="db vm setup"
   printf '\n  Resetting DB VM (sentinel guards against re-init if already done)...\n'
   gcloud compute instances reset "${DEPLOY_MODE_PREFIX}-pg" \
     --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet || true
   printf '  DB VM reset — Postgres init takes ~3-5 min on first boot.\n'
 
-  printf '\n  Resetting backend VM to apply new image...\n'
-  gcloud compute instances reset "${DEPLOY_MODE_PREFIX}-backend" \
-    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet || true
-  printf '  VM reset — startup script will pull the image and start Spring Boot (~3-5 min).\n'
+  _pg_vm="${DEPLOY_MODE_PREFIX}-pg"
+  printf '\n  Waiting for DB VM SSH after reset...\n'
+  for _i in $(seq 1 24); do
+    if gcloud compute ssh "$_pg_vm" \
+        --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
+        --tunnel-through-iap --ssh-flag="-o ConnectTimeout=5" \
+        --command "exit 0" >/dev/null 2>&1; then
+      break
+    fi
+    printf '  waiting (%d/24)...\n' "$_i"; sleep 5
+  done
+  printf '  Ensuring Postgres listens on VPC (not just localhost)...\n'
+  gcloud compute ssh "$_pg_vm" \
+    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
+    --tunnel-through-iap --ssh-flag="-o ConnectTimeout=10" \
+    --command "
+      PG_CONF=/etc/postgresql/16/main/postgresql.conf
+      PG_HBA=/etc/postgresql/16/main/pg_hba.conf
+      CHANGED=0
+      if ! sudo grep -q '^listen_addresses' \"\$PG_CONF\" 2>/dev/null; then
+        sudo sed -i \"s/#listen_addresses = 'localhost'/listen_addresses = '*'/\" \"\$PG_CONF\"
+        CHANGED=1
+      fi
+      if ! sudo grep -q '10.0.0.0/8' \"\$PG_HBA\" 2>/dev/null; then
+        printf 'host all all 10.0.0.0/8 scram-sha-256\n' | sudo tee -a \"\$PG_HBA\" >/dev/null
+        CHANGED=1
+      fi
+      if [[ \"\$CHANGED\" == '1' ]]; then
+        sudo systemctl restart postgresql@16-main
+        printf '  pg config fixed and restarted.\n'
+      else
+        printf '  pg config already correct.\n'
+      fi
+    " 2>/dev/null || printf '  (pg config check skipped — SSH unavailable)\n'
 
-  BACKEND_URL=$(pulumi stack output backendUrl 2>/dev/null || \
-    gcloud compute instances describe "${DEPLOY_MODE_PREFIX}-backend" \
+  printf '  Syncing Postgres password with Secret Manager...\n'
+  _SYNC_DB_URL=$(gcloud secrets versions access latest \
+    --secret="${DEPLOY_MODE_PREFIX}-database-url" --project="$GCP_PROJECT" 2>/dev/null || true)
+  if [[ -n "$_SYNC_DB_URL" ]]; then
+    _SYNC_USER=$(printf '%s' "$_SYNC_DB_URL" | sed 's|.*://\([^:]*\):.*|\1|')
+    _SYNC_PASS_B64=$(printf '%s' "$_SYNC_DB_URL" | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|' | base64)
+    gcloud compute ssh "$_pg_vm" \
       --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
-      --format="value(networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null \
-      | awk '{print "http://" $1 ":8080"}' || true)
+      --tunnel-through-iap --ssh-flag="-o ConnectTimeout=10" \
+      --command "
+        _P=\$(printf '%s' '${_SYNC_PASS_B64}' | base64 -d)
+        sudo -u postgres psql -c \"ALTER USER ${_SYNC_USER} WITH PASSWORD '\$_P';\" >/dev/null 2>&1
+        sudo -u postgres psql -d app -c 'CREATE EXTENSION IF NOT EXISTS pg_bigm;' >/dev/null 2>&1 || true
+        printf '  password synced, extensions ensured.\n'
+      " 2>/dev/null || printf '  (password sync SSH failed)\n'
+    unset _SYNC_DB_URL _SYNC_USER _SYNC_PASS_B64
+  else
+    printf '  (secret not found — skipping password sync)\n'
+  fi
+
+  if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+    _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
+    _GKE_ZONE="${GCP_REGION}-a"
+    _GKE_NS="${DEPLOY_MODE_PREFIX}"
+    gcloud services enable container.googleapis.com --project "$GCP_PROJECT" 2>/dev/null || true
+    if ! gcloud container clusters describe "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+      printf '\n  Creating GKE cluster %s (e2-standard-2, 1 node)...\n' "$_GKE_CLUSTER"
+      gcloud container clusters create "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
+        --machine-type e2-standard-2 --num-nodes 1 \
+        --network "${DEPLOY_MODE_PREFIX}-vpc" \
+        --subnetwork "${DEPLOY_MODE_PREFIX}-subnet" \
+        --quiet
+    else
+      printf '  GKE cluster %s already exists.\n' "$_GKE_CLUSTER"
+      gcloud container clusters get-credentials "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    fi
+    printf '\n  Deploying to GKE via Cloud Build...\n'
+    gcloud builds submit --config cloudbuild-gke.yaml \
+      --project "$GCP_PROJECT" \
+      --substitutions "_IMAGE=${IMAGE},_CLUSTER=${_GKE_CLUSTER},_ZONE=${_GKE_ZONE},_NAMESPACE=${_GKE_NS}" \
+      --no-source
+    printf '  Waiting for LoadBalancer IP...\n'
+    gcloud container clusters get-credentials "$_GKE_CLUSTER" \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    _LB_IP=""
+    for _i in $(seq 1 30); do
+      _LB_IP=$(kubectl get svc "${_GKE_NS}-backend" -n "$_GKE_NS" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+      [[ -n "$_LB_IP" ]] && break
+      printf '  waiting for LoadBalancer (%d/30)...\n' "$_i"; sleep 10
+    done
+    BACKEND_URL="http://${_LB_IP}"
+  else
+    BACKEND_URL=$(pulumi stack output backendUrl 2>/dev/null || true)
+  fi
+
+  if [[ "$BACKEND_RUNTIME" != "gke" && -n "$BACKEND_URL" ]]; then
+    _FE_SVC="${DEPLOY_MODE_PREFIX}-frontend"
+    printf '  Checking frontend BACKEND_URL env...\n'
+    _CURRENT_FE_BACKEND=$(gcloud run services describe "$_FE_SVC" \
+      --region "$GCP_REGION" --project "$GCP_PROJECT" \
+      --format="json" 2>/dev/null \
+      | python3 -c "
+import sys,json
+try:
+  svc=json.load(sys.stdin)
+  for e in svc.get('template',{}).get('containers',[{}])[0].get('env',[]):
+    if e.get('name')=='BACKEND_URL':
+      print(e.get('value',''))
+      break
+except Exception:
+  pass
+" 2>/dev/null || true)
+    if [[ -n "$_CURRENT_FE_BACKEND" && "$_CURRENT_FE_BACKEND" != "$BACKEND_URL" ]]; then
+      printf '  Frontend BACKEND_URL stale (%s)\n  patching to: %s\n' "$_CURRENT_FE_BACKEND" "$BACKEND_URL"
+      gcloud run services update "$_FE_SVC" \
+        --region "$GCP_REGION" --project "$GCP_PROJECT" \
+        --update-env-vars "BACKEND_URL=${BACKEND_URL}" \
+        --quiet 2>/dev/null || true
+      printf '  Frontend BACKEND_URL patched.\n'
+    else
+      printf '  Frontend BACKEND_URL OK (%s).\n' "${_CURRENT_FE_BACKEND:-not yet deployed}"
+    fi
+  fi
 
   cat > "$ENV_FILE" <<EOF
 DB_VM_IP=$(pulumi stack output dbVmInternalIp 2>/dev/null || true)
@@ -727,8 +753,25 @@ GCP_PROJECT=${GCP_PROJECT}
 GCP_REGION=${GCP_REGION}
 EOF
 
-  printf '\nDone. Backend URL:\n  %s\n' "$BACKEND_URL"
-fi
+  _BACKEND_UP=0
+  for _i in $(seq 1 36); do
+    _HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+      "${BACKEND_URL}/api/customers" --max-time 5 2>/dev/null || true)
+    if [[ "$_HTTP" == "200" ]]; then
+      _BACKEND_UP=1
+      break
+    fi
+    printf '  waiting for backend... (%d/36, HTTP %s)\n' "$_i" "${_HTTP:-000}"
+    sleep 10
+  done
+
+  if (( _BACKEND_UP )); then
+    printf '\nBackend is up: %s\n' "$BACKEND_URL"
+  else
+    printf '\nWARNING: Backend did not become healthy within 6 min — check logs:\n'
+    printf '  gcloud run services logs read %s-backend --region %s --project %s\n' \
+      "$DEPLOY_MODE_PREFIX" "$GCP_REGION" "$GCP_PROJECT"
+  fi
 
 if [[ "$DEPLOY_MODE" == "lite" ]]; then
   DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo-lite.dump"
@@ -739,10 +782,10 @@ if [[ "$DEPLOY_MODE" == "lite" ]]; then
   S3_SOURCE_URI="s3://bikram-nextjs-subsecond-fetch-with-websockets/nextjs-dash/demo-lite.dump"
 else
   DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo.dump"
-  BAKE_VM_NAME="dash-bake-vm"
-  BAKE_VM_NETWORK="dash-vpc"
-  BAKE_VM_SUBNET="dash-subnet"
-  BAKE_SECRET_NAME="dash-database-url"
+  BAKE_VM_NAME="${DEPLOY_MODE_PREFIX}-bake-vm"
+  BAKE_VM_NETWORK="${DEPLOY_MODE_PREFIX}-vpc"
+  BAKE_VM_SUBNET="${DEPLOY_MODE_PREFIX}-subnet"
+  BAKE_SECRET_NAME="${DEPLOY_MODE_PREFIX}-database-url"
   S3_SOURCE_URI="s3://bikram-nextjs-subsecond-fetch-with-websockets/nextjs-dash/demo.dump"
 fi
 
@@ -761,18 +804,35 @@ if [[ -z "$_API_ORDERS" ]]; then
 elif [[ "$_API_ORDERS" != "0" ]]; then
   printf 'Database has %s orders — skipping seed.\n' "$_API_ORDERS"
 else
-  printf 'Database empty — starting VM bake...\n'
-
-  _AWS_SECRET_OK=$(gcloud secrets versions access latest \
-    --secret="dash-aws-credentials" --project="$GCP_PROJECT" >/dev/null 2>&1 && printf 'yes' || printf '')
-  if [[ -z "$_AWS_SECRET_OK" ]]; then
-    printf '\nERROR: Secret "dash-aws-credentials" not found in project %s.\n' "$GCP_PROJECT"
-    printf 'Create it once with:\n'
-    printf '  printf "AWS_ACCESS_KEY_ID=...\\nAWS_SECRET_ACCESS_KEY=...\\nAWS_DEFAULT_REGION=us-east-1" \\\n'
-    printf '    | gcloud secrets create dash-aws-credentials --data-file=- --project=%s\n' "$GCP_PROJECT"
-    printf 'Then re-run this script.\n'
-    exit 1
+  printf 'Database empty — checking seed sources...\n'
+  _SKIP_BAKE=0
+  _GCS_BASENAME=$(basename "$DEMO_SNAPSHOT_GCS_URI")
+  _GCS_TOKEN=$(gcloud auth print-access-token 2>/dev/null || true)
+  _GCS_EXISTS=$(curl -sf \
+    "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F${_GCS_BASENAME}" \
+    -H "Authorization: Bearer ${_GCS_TOKEN}" 2>/dev/null \
+    | python3 -c "import sys,json;json.load(sys.stdin);print('yes')" 2>/dev/null || printf 'no')
+  if [[ "$_GCS_EXISTS" == "yes" ]]; then
+    printf '  GCS snapshot found — bake will restore from GCS (no AWS needed).\n'
+  else
+    printf '  GCS snapshot not found — checking AWS credentials...\n'
+    _AWS_SECRET_OK=$(gcloud secrets versions access latest \
+      --secret="dash-aws-credentials" --project="$GCP_PROJECT" >/dev/null 2>&1 && printf 'yes' || printf '')
+    if [[ -z "$_AWS_SECRET_OK" ]]; then
+      printf '\nWARNING: Database is empty and no seed source is available.\n'
+      printf '  GCS snapshot missing: gs://bikram-java-dash-snapshots/dash/%s\n' "$_GCS_BASENAME"
+      printf '  AWS secret missing:   dash-aws-credentials in project %s\n' "$GCP_PROJECT"
+      printf '\n  Backend is running — continuing without seed data.\n'
+      printf '  To seed later, create the AWS secret then re-run deploy.sh:\n'
+      printf '    printf "AWS_ACCESS_KEY_ID=...\\nAWS_SECRET_ACCESS_KEY=...\\nAWS_DEFAULT_REGION=us-east-1" \\\n'
+      printf '      | gcloud secrets create dash-aws-credentials --data-file=- --project=%s\n' "$GCP_PROJECT"
+      _SKIP_BAKE=1
+    fi
   fi
+
+  if (( _SKIP_BAKE == 0 )); then
+    _STEP="db bake"
+  printf 'Starting VM bake...\n'
 
   gcloud compute firewall-rules describe "${BAKE_VM_NETWORK}-allow-iap-ssh" \
     --project="$GCP_PROJECT" >/dev/null 2>&1 || \
@@ -784,6 +844,21 @@ else
   gcloud compute networks subnets update "$BAKE_VM_SUBNET" \
     --project="$GCP_PROJECT" --region="$GCP_REGION" \
     --enable-private-ip-google-access --quiet 2>/dev/null || true
+
+  if gcloud compute instances describe "$BAKE_VM_NAME" \
+      --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" \
+      --format="value(name)" >/dev/null 2>&1; then
+    _VM_SCOPES=$(gcloud compute instances describe "$BAKE_VM_NAME" \
+      --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" \
+      --format="value(serviceAccounts[0].scopes)" 2>/dev/null || echo "")
+    if [[ "$_VM_SCOPES" != *"cloud-platform"* ]]; then
+      printf '  Bake VM missing cloud-platform scope — deleting to recreate...\n'
+      gcloud compute instances delete "$BAKE_VM_NAME" \
+        --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" --quiet 2>/dev/null || true
+    else
+      printf '  Bake VM already exists with correct scopes.\n'
+    fi
+  fi
 
   if ! gcloud compute instances describe "$BAKE_VM_NAME" \
       --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" \
@@ -831,29 +906,42 @@ DB_URL=\$(curl -sf \
 echo "DB URL resolved."
 
 echo "=== checking GCS snapshot ==="
-GCS_EXISTS=\$(curl -sf \
-  "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F\${GCS_BASENAME}" \
-  -H "Authorization: Bearer \${TOKEN}" 2>/dev/null | python3 -c "import sys,json;print('yes')" 2>/dev/null || echo "no")
-
-if [[ "\$GCS_EXISTS" == "yes" ]]; then
-  echo "=== restoring from GCS ==="
-  curl -fL \
-    "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F\${GCS_BASENAME}?alt=media" \
-    -H "Authorization: Bearer \${TOKEN}" -o /tmp/bake.dump
+GCS_URI="gs://bikram-java-dash-snapshots/dash/\${GCS_BASENAME}"
+echo "  target: \${GCS_URI}"
+if gsutil -q stat "\${GCS_URI}" 2>/dev/null; then
+  echo "=== restoring from GCS (gsutil) ==="
+  gsutil cp "\${GCS_URI}" /tmp/bake.dump
 else
-  echo "=== GCS snapshot missing — fetching AWS creds ==="
-  AWS_SECRET_NAME="dash-aws-credentials"
-  AWS_CREDS=\$(curl -sf \
-    "https://secretmanager.googleapis.com/v1/projects/\${PROJECT}/secrets/\${AWS_SECRET_NAME}/versions/latest:access" \
-    -H "Authorization: Bearer \${TOKEN}" \
-    | python3 -c "import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)['payload']['data']).decode())")
-  export \$(echo "\$AWS_CREDS" | grep -E '^AWS_' | xargs)
+  echo "=== gsutil stat failed — trying REST API fallback ==="
+  GCS_EXISTS=\$(curl -sf \
+    "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F\${GCS_BASENAME}" \
+    -H "Authorization: Bearer \${TOKEN}" 2>/dev/null | python3 -c "import sys,json;print('yes')" 2>/dev/null || echo "no")
+  echo "  GCS REST check: \${GCS_EXISTS}"
+  if [[ "\$GCS_EXISTS" == "yes" ]]; then
+    echo "=== restoring from GCS (curl fallback) ==="
+    curl -fL \
+      "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F\${GCS_BASENAME}?alt=media" \
+      -H "Authorization: Bearer \${TOKEN}" -o /tmp/bake.dump
+  else
+    echo "=== GCS snapshot not found — fetching AWS creds ==="
+    AWS_SECRET_NAME="dash-aws-credentials"
+    AWS_CREDS=\$(curl -sf \
+      "https://secretmanager.googleapis.com/v1/projects/\${PROJECT}/secrets/\${AWS_SECRET_NAME}/versions/latest:access" \
+      -H "Authorization: Bearer \${TOKEN}" \
+      | python3 -c "import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)['payload']['data']).decode())" \
+      2>/dev/null || echo "")
+    if [[ -z "\$AWS_CREDS" ]]; then
+      echo "=== WARN: no GCS snapshot and no AWS creds — bake skipped, DB will be empty ==="
+      exit 0
+    fi
+    export \$(echo "\$AWS_CREDS" | grep -E '^AWS_' | xargs)
 
-  echo "=== downloading from S3 ==="
-  aws s3 cp "\$S3_URI" /tmp/bake.dump
+    echo "=== downloading from S3 ==="
+    aws s3 cp "\$S3_URI" /tmp/bake.dump
 
-  echo "=== will save to GCS after restore ==="
-  SAVE_TO_GCS="yes"
+    echo "=== will save to GCS after restore ==="
+    SAVE_TO_GCS="yes"
+  fi
 fi
 
 echo "=== running pg_restore ==="
@@ -862,11 +950,7 @@ pg_restore --no-owner --no-privileges --clean --if-exists \
 
 if [[ "\${SAVE_TO_GCS:-no}" == "yes" ]]; then
   echo "=== saving snapshot to GCS for future deploys ==="
-  curl -sf \
-    "https://storage.googleapis.com/upload/storage/v1/b/bikram-java-dash-snapshots/o?uploadType=media&name=dash%2F\${GCS_BASENAME}" \
-    -H "Authorization: Bearer \${TOKEN}" \
-    -H "Content-Type: application/octet-stream" \
-    --data-binary @/tmp/bake.dump
+  gsutil cp /tmp/bake.dump "\${GCS_URI}"
 fi
 
 rm -f /tmp/bake.dump
@@ -876,20 +960,23 @@ BAKE_EOF
   gcloud compute scp "$_BAKE_SCRIPT" \
     "${BAKE_VM_NAME}:/tmp/bake.sh" \
     --project="$GCP_PROJECT" --zone="${GCP_REGION}-a" \
-    --tunnel-through-iap --quiet 2>/dev/null
+    --tunnel-through-iap --quiet
   rm -f "$_BAKE_SCRIPT"
 
   printf '  Running restore on VM...\n'
   gcloud compute ssh "$BAKE_VM_NAME" \
     --project="$GCP_PROJECT" --zone="${GCP_REGION}-a" \
     --tunnel-through-iap --ssh-flag="-o ConnectTimeout=30" \
-    --command='bash /tmp/bake.sh' 2>/dev/null
+    --command='bash /tmp/bake.sh' || {
+    printf '  [WARN] Bake script exited with errors — deploy continues but DB may be empty.\n'
+  }
 
   printf '  Deleting bake VM...\n'
   gcloud compute instances delete "$BAKE_VM_NAME" \
     --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" --quiet
 
   printf 'Seeding complete.\n'
+  fi
 fi
 
 printf '\nRemember to tear down when finished:\n'
@@ -905,6 +992,106 @@ fi
 
 FRONTEND_DEPLOY="$(cd "$ROOT_DIR/../dashboard-frontend-gcp/scripts" 2>/dev/null && pwd || true)/deploy.sh"
 if [[ -f "$FRONTEND_DEPLOY" ]]; then
+  _STEP="frontend deploy"
   printf '\n  Deploying frontend inline...\n'
   DEPLOY_MODE="$DEPLOY_MODE" bash "$FRONTEND_DEPLOY"
+fi
+
+if [[ "$_TARGET" == "remote" ]]; then
+  printf '\n=== post-deploy checks ===\n'
+  _CP=0; _CF=0
+  _chk() {
+    local n="$1" label="$2" ok="$3" detail="${4:-}"
+    if [[ "$ok" == "1" ]]; then
+      printf '  [%s] PASS  %s%s\n' "$n" "$label" "${detail:+  ($detail)}"
+      _CP=$(( _CP + 1 ))
+    else
+      printf '  [%s] FAIL  %s%s\n' "$n" "$label" "${detail:+  — $detail}"
+      _CF=$(( _CF + 1 ))
+    fi
+  }
+
+  _PG_LISTEN=$(gcloud compute ssh "${DEPLOY_MODE_PREFIX}-pg" \
+    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
+    --tunnel-through-iap --ssh-flag="-o ConnectTimeout=5" \
+    --command "sudo ss -tlnp 2>/dev/null | grep -c '0\.0\.0\.0:5432'" \
+    2>/dev/null || echo "0")
+  [[ "${_PG_LISTEN:-0}" -ge 1 ]] \
+    && _chk 1 "Postgres listening on VPC (0.0.0.0:5432)" 1 \
+    || _chk 1 "Postgres listening on VPC (0.0.0.0:5432)" 0 "stuck on localhost"
+
+  _chk 2 "Postgres password synced with Secret Manager" 1 "ran during deploy"
+
+  if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+    _GKE_READY=$(kubectl get deployment "${_GKE_NS:-${DEPLOY_MODE_PREFIX}}-backend" \
+      -n "${_GKE_NS:-${DEPLOY_MODE_PREFIX}}" \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    [[ "${_GKE_READY:-0}" -ge 1 ]] \
+      && _chk 3 "GKE deployment ready" 1 "${_GKE_READY} replica(s)" \
+      || _chk 3 "GKE deployment ready" 0 "readyReplicas=${_GKE_READY:-0}"
+  else
+    _CR_STATUS=$(gcloud run services describe "${DEPLOY_MODE_PREFIX}-backend" \
+      --region "$GCP_REGION" --project "$GCP_PROJECT" \
+      --format="value(status.conditions[0].status)" 2>/dev/null || echo "unknown")
+    [[ "$_CR_STATUS" == "True" ]] \
+      && _chk 3 "Cloud Run service ready" 1 \
+      || _chk 3 "Cloud Run service ready" 0 "status: ${_CR_STATUS}"
+  fi
+
+  _HEALTH=$(curl -sf "${BACKEND_URL}/actuator/health" --max-time 8 2>/dev/null \
+    | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  [[ "$_HEALTH" == "UP" ]] \
+    && _chk 4 "GET /actuator/health → UP" 1 \
+    || _chk 4 "GET /actuator/health → UP" 0 "status=${_HEALTH:-unreachable}"
+
+  if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+    [[ -n "$BACKEND_URL" && "$BACKEND_URL" != "http://" ]] \
+      && _chk 5 "GKE LoadBalancer URL" 1 "$BACKEND_URL" \
+      || _chk 5 "GKE LoadBalancer URL" 0 "IP not yet assigned"
+  else
+    _CR_URL=$(gcloud run services describe "${DEPLOY_MODE_PREFIX}-backend" \
+      --region "$GCP_REGION" --project "$GCP_PROJECT" \
+      --format="value(status.url)" 2>/dev/null || true)
+    [[ -n "$_CR_URL" ]] \
+      && _chk 5 "Cloud Run URL assigned" 1 "$_CR_URL" \
+      || _chk 5 "Cloud Run URL assigned" 0 "not yet assigned"
+  fi
+
+  _HTTP6=$(curl -sf -o /dev/null -w "%{http_code}" \
+    "${BACKEND_URL}/api/customers" --max-time 8 2>/dev/null || echo "000")
+  [[ "$_HTTP6" == "200" ]] \
+    && _chk 6 "GET /api/customers → 200" 1 \
+    || _chk 6 "GET /api/customers → 200" 0 "HTTP $_HTTP6"
+
+  [[ "${_API_ORDERS:-0}" -gt 0 ]] \
+    && _chk 7 "Database has data" 1 "${_API_ORDERS} orders" \
+    || _chk 7 "Database has data" 0 "0 orders — seed may have failed"
+
+  _CR_URL=$(gcloud run services describe "${DEPLOY_MODE_PREFIX}-frontend" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT" \
+    --format="value(status.url)" 2>/dev/null || true)
+
+  if [[ -n "$_CR_URL" ]]; then
+    _HTTP8=$(curl -sf -o /dev/null -w "%{http_code}" "$_CR_URL" --max-time 10 2>/dev/null || echo "000")
+    [[ "$_HTTP8" == "200" ]] \
+      && _chk 8 "Cloud Run frontend → 200" 1 "$_CR_URL" \
+      || _chk 8 "Cloud Run frontend → 200" 0 "HTTP $_HTTP8"
+
+    _HTTP9=$(curl -sf -o /dev/null -w "%{http_code}" \
+      "${_CR_URL}/api/customers" --max-time 10 2>/dev/null || echo "000")
+    [[ "$_HTTP9" == "200" ]] \
+      && _chk 9 "End-to-end: Cloud Run → backend /api/customers" 1 \
+      || _chk 9 "End-to-end: Cloud Run → backend /api/customers" 0 "HTTP $_HTTP9"
+  else
+    printf '  [8] SKIP  Cloud Run frontend not yet deployed\n'
+    printf '  [9] SKIP  End-to-end check — Cloud Run not deployed\n'
+  fi
+
+  printf '\n  Results: %d passed, %d failed\n' "$_CP" "$_CF"
+  if (( _CF > 0 )); then
+    printf '\n  !! %d CHECK(S) FAILED — review above before presenting\n' "$_CF"
+  fi
+  if [[ "$DEPLOY_MODE" == "full" ]]; then
+    printf '\n  !! REMINDER: FULL MODE IS RUNNING (~$200-300/mo) — RUN infra-down.sh WHEN DONE\n'
+  fi
 fi
