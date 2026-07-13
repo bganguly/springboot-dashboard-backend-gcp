@@ -460,6 +460,18 @@ PYEOF
     2>/dev/null || true)
 
     if [[ -z "$conflicts" ]]; then
+      local deletion_fail_urns
+      deletion_fail_urns=$(grep -oE 'error: deleting urn:pulumi:[^ ]+' "$log_file" \
+        | sed 's/^error: deleting //; s/:$//' | sort -u || true)
+      if [[ -n "$deletion_fail_urns" ]]; then
+        printf '[deploy] Auto-purging stale state entries that GCP refused to delete...\n'
+        while IFS= read -r urn; do
+          [[ -z "$urn" ]] && continue
+          printf '  purging: %s\n' "$urn"
+          pulumi state delete "$urn" --yes 2>/dev/null || true
+        done <<< "$deletion_fail_urns"
+        continue
+      fi
       local protected_urns
       protected_urns=$(grep -oE "urn:pulumi:[^ \"']+" "$log_file" \
         | tr -d '"' | grep -v '^$' | sort -u || true)
