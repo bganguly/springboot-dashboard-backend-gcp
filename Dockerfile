@@ -9,8 +9,10 @@ RUN ./gradlew bootJar --no-daemon -q
 
 FROM eclipse-temurin:21-jre-alpine AS runner
 WORKDIR /app
-RUN addgroup -S app && adduser -S app -G app
+RUN addgroup -S app && adduser -S app -G app && apk add --no-cache netcat-openbsd
 COPY --from=builder /app/build/libs/*.jar app.jar
+COPY docker-entrypoint.sh entrypoint.sh
+RUN chmod +x entrypoint.sh
 USER app
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["./entrypoint.sh"]
