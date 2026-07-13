@@ -677,100 +677,6 @@ PYAML
     printf '  (secret not found — skipping password sync)\n'
   fi
 
-  if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
-    _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
-    _GKE_ZONE="${GCP_REGION}-a"
-    _GKE_NS="${DEPLOY_MODE_PREFIX}"
-    gcloud services enable container.googleapis.com --project "$GCP_PROJECT" 2>/dev/null || true
-    if ! gcloud container clusters describe "$_GKE_CLUSTER" \
-        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
-      printf '\n  Creating GKE cluster %s (e2-standard-2, 1 node)...\n' "$_GKE_CLUSTER"
-      gcloud container clusters create "$_GKE_CLUSTER" \
-        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
-        --machine-type e2-standard-2 --num-nodes 1 \
-        --network "${DEPLOY_MODE_PREFIX}-vpc" \
-        --subnetwork "${DEPLOY_MODE_PREFIX}-subnet" \
-        --quiet
-    else
-      printf '  GKE cluster %s already exists.\n' "$_GKE_CLUSTER"
-      gcloud container clusters get-credentials "$_GKE_CLUSTER" \
-        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
-    fi
-    printf '\n  Deploying to GKE via Cloud Build...\n'
-    gcloud builds submit --config cloudbuild-gke.yaml \
-      --project "$GCP_PROJECT" \
-      --substitutions "_IMAGE=${IMAGE},_CLUSTER=${_GKE_CLUSTER},_ZONE=${_GKE_ZONE},_NAMESPACE=${_GKE_NS}" \
-      --no-source
-    printf '  Waiting for LoadBalancer IP...\n'
-    gcloud container clusters get-credentials "$_GKE_CLUSTER" \
-      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
-    _LB_IP=""
-    for _i in $(seq 1 30); do
-      _LB_IP=$(kubectl get svc "${_GKE_NS}-backend" -n "$_GKE_NS" \
-        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-      [[ -n "$_LB_IP" ]] && break
-      printf '  waiting for LoadBalancer (%d/30)...\n' "$_i"; sleep 10
-    done
-    BACKEND_URL="http://${_LB_IP}"
-  else
-    BACKEND_URL=$(pulumi stack output backendUrl 2>/dev/null || true)
-  fi
-
-  if [[ "$BACKEND_RUNTIME" != "gke" && -n "$BACKEND_URL" ]]; then
-    _FE_SVC="${DEPLOY_MODE_PREFIX}-frontend"
-    printf '  Checking frontend BACKEND_URL env...\n'
-    _CURRENT_FE_BACKEND=$(gcloud run services describe "$_FE_SVC" \
-      --region "$GCP_REGION" --project "$GCP_PROJECT" \
-      --format="json" 2>/dev/null \
-      | python3 -c "
-import sys,json
-try:
-  svc=json.load(sys.stdin)
-  for e in svc.get('template',{}).get('containers',[{}])[0].get('env',[]):
-    if e.get('name')=='BACKEND_URL':
-      print(e.get('value',''))
-      break
-except Exception:
-  pass
-" 2>/dev/null || true)
-    if [[ -n "$_CURRENT_FE_BACKEND" && "$_CURRENT_FE_BACKEND" != "$BACKEND_URL" ]]; then
-      printf '  Frontend BACKEND_URL stale (%s)\n  patching to: %s\n' "$_CURRENT_FE_BACKEND" "$BACKEND_URL"
-      gcloud run services update "$_FE_SVC" \
-        --region "$GCP_REGION" --project "$GCP_PROJECT" \
-        --update-env-vars "BACKEND_URL=${BACKEND_URL}" \
-        --quiet 2>/dev/null || true
-      printf '  Frontend BACKEND_URL patched.\n'
-    else
-      printf '  Frontend BACKEND_URL OK (%s).\n' "${_CURRENT_FE_BACKEND:-not yet deployed}"
-    fi
-  fi
-
-  cat > "$ENV_FILE" <<EOF
-DB_VM_IP=$(pulumi stack output dbVmInternalIp 2>/dev/null || true)
-ARTIFACT_REGISTRY=$(pulumi stack output artifactRegistry 2>/dev/null || true)
-CLOUD_RUN_URL=${BACKEND_URL}
-GCP_PROJECT=${GCP_PROJECT}
-GCP_REGION=${GCP_REGION}
-EOF
-
-  printf '\nBackend URL: %s\n' "$BACKEND_URL"
-
-  if [[ -n "$BACKEND_URL" ]]; then
-    python3 - "${ROOT_DIR}/README.md" "$BACKEND_URL" <<'PYEOF'
-import re, sys
-path, url = sys.argv[1], sys.argv[2]
-content = open(path).read()
-content = re.sub(r'(\| \*\*Backend API\*\* \| )https?://\S+( \|)', rf'\g<1>{url}\g<2>', content)
-content = re.sub(r'^BASE=https?://\S+', f'BASE={url}', content, flags=re.MULTILINE)
-open(path, 'w').write(content)
-PYEOF
-    if ! git -C "$ROOT_DIR" diff --quiet README.md 2>/dev/null; then
-      git -C "$ROOT_DIR" add README.md
-      git -C "$ROOT_DIR" commit -m "update live backend URL: ${BACKEND_URL}"
-      git -C "$ROOT_DIR" push origin main
-    fi
-  fi
-
 if [[ "$DEPLOY_MODE" == "lite" ]]; then
   DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo-lite.dump"
   BAKE_VM_NAME="dash-bake-vm"
@@ -984,6 +890,101 @@ BAKE_EOF
   printf 'Seeding complete.\n'
   fi
 fi
+
+  if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+    _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
+    _GKE_ZONE="${GCP_REGION}-a"
+    _GKE_NS="${DEPLOY_MODE_PREFIX}"
+    gcloud services enable container.googleapis.com --project "$GCP_PROJECT" 2>/dev/null || true
+    if ! gcloud container clusters describe "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+      printf '\n  Creating GKE cluster %s (e2-standard-2, 1 node)...\n' "$_GKE_CLUSTER"
+      gcloud container clusters create "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
+        --machine-type e2-standard-2 --num-nodes 1 \
+        --network "${DEPLOY_MODE_PREFIX}-vpc" \
+        --subnetwork "${DEPLOY_MODE_PREFIX}-subnet" \
+        --quiet
+    else
+      printf '  GKE cluster %s already exists.\n' "$_GKE_CLUSTER"
+      gcloud container clusters get-credentials "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    fi
+    printf '\n  Deploying to GKE via Cloud Build...\n'
+    gcloud builds submit --config cloudbuild-gke.yaml \
+      --project "$GCP_PROJECT" \
+      --substitutions "_IMAGE=${IMAGE},_CLUSTER=${_GKE_CLUSTER},_ZONE=${_GKE_ZONE},_NAMESPACE=${_GKE_NS}" \
+      --no-source
+    printf '  Waiting for LoadBalancer IP...\n'
+    gcloud container clusters get-credentials "$_GKE_CLUSTER" \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    _LB_IP=""
+    for _i in $(seq 1 30); do
+      _LB_IP=$(kubectl get svc "${_GKE_NS}-backend" -n "$_GKE_NS" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+      [[ -n "$_LB_IP" ]] && break
+      printf '  waiting for LoadBalancer (%d/30)...\n' "$_i"; sleep 10
+    done
+    BACKEND_URL="http://${_LB_IP}"
+  else
+    BACKEND_URL=$(pulumi stack output backendUrl 2>/dev/null || true)
+  fi
+
+  if [[ "$BACKEND_RUNTIME" != "gke" && -n "$BACKEND_URL" ]]; then
+    _FE_SVC="${DEPLOY_MODE_PREFIX}-frontend"
+    printf '  Checking frontend BACKEND_URL env...\n'
+    _CURRENT_FE_BACKEND=$(gcloud run services describe "$_FE_SVC" \
+      --region "$GCP_REGION" --project "$GCP_PROJECT" \
+      --format="json" 2>/dev/null \
+      | python3 -c "
+import sys,json
+try:
+  svc=json.load(sys.stdin)
+  for e in svc.get('template',{}).get('containers',[{}])[0].get('env',[]):
+    if e.get('name')=='BACKEND_URL':
+      print(e.get('value',''))
+      break
+except Exception:
+  pass
+" 2>/dev/null || true)
+    if [[ -n "$_CURRENT_FE_BACKEND" && "$_CURRENT_FE_BACKEND" != "$BACKEND_URL" ]]; then
+      printf '  Frontend BACKEND_URL stale (%s)\n  patching to: %s\n' "$_CURRENT_FE_BACKEND" "$BACKEND_URL"
+      gcloud run services update "$_FE_SVC" \
+        --region "$GCP_REGION" --project "$GCP_PROJECT" \
+        --update-env-vars "BACKEND_URL=${BACKEND_URL}" \
+        --quiet 2>/dev/null || true
+      printf '  Frontend BACKEND_URL patched.\n'
+    else
+      printf '  Frontend BACKEND_URL OK (%s).\n' "${_CURRENT_FE_BACKEND:-not yet deployed}"
+    fi
+  fi
+
+  cat > "$ENV_FILE" <<EOF
+DB_VM_IP=$(pulumi stack output dbVmInternalIp 2>/dev/null || true)
+ARTIFACT_REGISTRY=$(pulumi stack output artifactRegistry 2>/dev/null || true)
+CLOUD_RUN_URL=${BACKEND_URL}
+GCP_PROJECT=${GCP_PROJECT}
+GCP_REGION=${GCP_REGION}
+EOF
+
+  printf '\nBackend URL: %s\n' "$BACKEND_URL"
+
+  if [[ -n "$BACKEND_URL" ]]; then
+    python3 - "${ROOT_DIR}/README.md" "$BACKEND_URL" <<'PYEOF'
+import re, sys
+path, url = sys.argv[1], sys.argv[2]
+content = open(path).read()
+content = re.sub(r'(\| \*\*Backend API\*\* \| )https?://\S+( \|)', rf'\g<1>{url}\g<2>', content)
+content = re.sub(r'^BASE=https?://\S+', f'BASE={url}', content, flags=re.MULTILINE)
+open(path, 'w').write(content)
+PYEOF
+    if ! git -C "$ROOT_DIR" diff --quiet README.md 2>/dev/null; then
+      git -C "$ROOT_DIR" add README.md
+      git -C "$ROOT_DIR" commit -m "update live backend URL: ${BACKEND_URL}"
+      git -C "$ROOT_DIR" push origin main
+    fi
+  fi
+
 
 printf '\nRemember to tear down when finished:\n'
 printf '  ./scripts/infra-down.sh\n'
