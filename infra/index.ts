@@ -146,9 +146,8 @@ new gcp.secretmanager.SecretIamMember("backend-db-url-access", {
   member: pulumi.interpolate`serviceAccount:${backendSa.email}`,
 });
 
-new gcp.artifactregistry.RepositoryIamMember("backend-ar-reader", {
-  location: region,
-  repository: registry.repositoryId,
+new gcp.projects.IAMMember("backend-ar-reader", {
+  project,
   role: "roles/artifactregistry.reader",
   member: pulumi.interpolate`serviceAccount:${backendSa.email}`,
 });
