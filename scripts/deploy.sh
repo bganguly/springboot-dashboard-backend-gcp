@@ -33,10 +33,10 @@ printf '\n=== springboot-dashboard-backend-gcp ===\n\n'
 printf '  [1] Local  — Spring Boot on localhost + local Postgres (no GCP cost)'
 (( _local_running )) && printf ' [running]' || printf ' [not detected]'
 printf '\n'
-printf '  [2] Lite   — GCP: Cloud Run + db-g1-small (scales to zero, cold starts OK)'
+printf '  [2] Lite   — GCP: Cloud Run + e2-standard-2 Postgres VM (scales to zero, cold starts OK)'
 (( _lite_count > 0 )) && printf ' [%s resources active]' "$_lite_count" || printf ' [not deployed]'
 printf '\n'
-printf '  [3] Full   — GCP: Cloud Run + db-custom-4-16384 (min 1 instance, always warm)'
+printf '  [3] Full   — GCP: Cloud Run + n2-standard-4 Postgres VM (min 1 instance, always warm)'
 (( _full_count > 0 )) && printf ' [%s resources active]' "$_full_count" || printf ' [not deployed]'
 printf '\n'
 printf '               Full also unlocks GKE deployment.\n'
@@ -51,13 +51,13 @@ esac
 if [[ "$_TARGET" == "remote" ]]; then
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     printf '\n--- Lite GCP summary ---\n'
-    printf '  DB:         db-g1-small (1 vCPU, 1.7 GB), 10 GB disk\n'
+    printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
     printf '  Cloud Run:  min=0 instances (cold starts ~5s), max=1, 1 CPU / 512 Mi\n'
     printf '  GKE:        skipped\n'
-    printf '  Cost est:   ~$30-50/mo if left running\n'
+    printf '  Cost est:   ~$50-70/mo if left running\n'
   else
     printf '\n--- Full GCP summary ---\n'
-    printf '  DB:         db-custom-4-16384 (4 vCPU, 16 GB), 35 GB disk\n'
+    printf '  DB:         n2-standard-4 Postgres 16 VM (4 vCPU, 16 GB), 35 GB SSD\n'
     printf '  Cloud Run:  min=1 instance (always warm), max=5, 2 CPU / 1 Gi\n'
     printf '  GKE:        available (you will be prompted)\n'
     printf '  Cost est:   ~$200-300/mo if left running — TEAR DOWN when done\n'
@@ -97,18 +97,33 @@ if [[ "$_TARGET" == "local" ]]; then
     sdk install gradle"
   ok "gradle" "$(gradle --version 2>/dev/null | grep '^Gradle ' | head -1)"
 
-  command -v psql >/dev/null 2>&1 || fail "psql not found — install Postgres (brew install postgresql@15)"
+  command -v psql >/dev/null 2>&1 || fail "psql not found — install Postgres (brew install postgresql@16)"
   ok "psql" "$(psql --version)"
 
   if ! pg_isready >/dev/null 2>&1; then
     printf '  postgres: not running — starting...\n'
     if command -v brew >/dev/null 2>&1; then
-      brew services start postgresql@15 2>/dev/null || brew services start postgresql 2>/dev/null || true
+      brew services start postgresql@16 2>/dev/null || brew services start postgresql 2>/dev/null || true
       sleep 2
     fi
-    pg_isready >/dev/null 2>&1 || fail "Postgres did not start. Install: brew install postgresql@15"
+    pg_isready >/dev/null 2>&1 || fail "Postgres did not start. Install: brew install postgresql@16"
   fi
   ok "postgres" "ready"
+
+  if ! psql -Atqc \
+      "SELECT 1 FROM pg_available_extensions WHERE name='pg_bigm'" \
+      2>/dev/null | grep -q 1; then
+    printf '  pg_bigm not found — building from source...\n'
+    _pg_cfg=$(brew --prefix postgresql@16)/bin/pg_config
+    _tmp=$(mktemp -d)
+    git clone --depth 1 https://github.com/pgbigm/pg_bigm.git "$_tmp/pg_bigm"
+    make -C "$_tmp/pg_bigm" USE_PGXS=1 PG_CONFIG="$_pg_cfg"
+    make -C "$_tmp/pg_bigm" USE_PGXS=1 PG_CONFIG="$_pg_cfg" install
+    rm -rf "$_tmp"
+    printf '  pg_bigm installed — restarting postgresql@16...\n'
+    brew services restart postgresql@16
+    for _i in $(seq 1 10); do pg_isready -q 2>/dev/null && break; sleep 1; done
+  fi
 
   if [[ ! -f "$ROOT_DIR/gradlew" ]]; then
     printf '\ngradlew not found — generating...\n'
@@ -135,6 +150,10 @@ if [[ "$_TARGET" == "local" ]]; then
     psql -d "$DB" -f src/main/resources/db/migration/V1__initial_schema.sql
     psql -d "$DB" -f src/main/resources/db/migration/V2__daily_summary.sql
     psql -d "$DB" -f src/main/resources/db/migration/V3__indexes_and_read_models.sql
+    psql -d "$DB" -f src/main/resources/db/migration/V4__search_text.sql
+    psql -d "$DB" -f src/main/resources/db/migration/V5__customer_sort_index.sql
+    psql -d "$DB" -f src/main/resources/db/migration/V6__count_cache.sql
+    psql -d "$DB" -f src/main/resources/db/migration/V7__daily_order_count.sql
 
     printf '[3/4] seeding %s orders...\n' "$ORDERS"
     psql -d "$DB" -v orders="$ORDERS" -f scripts/seed-large.sql
@@ -147,12 +166,84 @@ if [[ "$_TARGET" == "local" ]]; then
     ok "database" "$DB (exists — skipping setup)"
   fi
 
+  if psql -d "$DB" -Atqc "SELECT 1 FROM pg_available_extensions WHERE name='pg_bigm'" 2>/dev/null | grep -q 1; then
+    _missing_bigm=$(psql -d "$DB" -Atqc \
+      "SELECT COUNT(*) FROM pg_indexes WHERE indexname IN ('idx_orders_search_text_bigm','idx_orders_notes_bigm','idx_customers_bigm')" \
+      2>/dev/null || echo 0)
+    _build_bigm_index() {
+      local label="$1" sql="$2"
+      printf '  [bigm] %s ... ' "$label"
+      psql -d "$DB" -c "$sql" &
+      local bg=$!
+      local dots=0
+      while kill -0 "$bg" 2>/dev/null; do
+        sleep 3
+        _pct=$(psql -d "$DB" -Atqc \
+          "SELECT COALESCE(ROUND(100*blocks_done::numeric/NULLIF(blocks_total,0)),0) FROM pg_stat_progress_create_index WHERE relid=(SELECT oid FROM pg_class WHERE relname IN ('orders','customers') LIMIT 1) LIMIT 1" \
+          2>/dev/null)
+        if [[ -n "$_pct" && "$_pct" != "0" ]]; then
+          printf '\r  [bigm] %s ... %s%%   ' "$label" "$_pct"
+        else
+          dots=$(( (dots+1) % 4 ))
+          printf '\r  [bigm] %s ... %s   ' "$label" "$(printf '%0.s.' $(seq 1 $((dots+1))))"
+        fi
+      done
+      wait "$bg" && printf '\r  [bigm] %s ... done        \n' "$label" || { printf '\r  [bigm] %s ... FAILED (rc=%d)\n' "$label" "$?"; return 1; }
+    }
+
+    if [[ "$_missing_bigm" -lt 3 ]]; then
+      printf '\n=== building pg_bigm search indexes (one-time) ===\n'
+      psql -d "$DB" -c "CREATE EXTENSION IF NOT EXISTS pg_bigm;" 2>/dev/null
+      _build_bigm_index "idx_orders_search_text_bigm" \
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_search_text_bigm ON orders USING gin (search_text gin_bigm_ops);"
+      _build_bigm_index "idx_orders_notes_bigm" \
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_notes_bigm ON orders USING gin (notes gin_bigm_ops);"
+      _build_bigm_index "idx_customers_bigm" \
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_customers_bigm ON customers USING gin ((\"firstName\"||' '||\"lastName\"||' '||email) gin_bigm_ops);"
+      psql -d "$DB" -c "DROP INDEX IF EXISTS idx_orders_search_text_trgm;" 2>/dev/null
+      psql -d "$DB" -c "DROP INDEX IF EXISTS idx_orders_notes_trgm;" 2>/dev/null
+      psql -d "$DB" -c "DROP INDEX IF EXISTS idx_customers_trgm;" 2>/dev/null
+      printf '  pg_bigm indexes ready.\n'
+    else
+      ok "pg_bigm indexes" "already in place"
+    fi
+  fi
+
   printf '\n=== diagnostics ===\n'
   DATABASE_URL="$DB_URL" ./scripts/diagnose.sh
 
+  BACKEND_LOG="$ROOT_DIR/backend.log"
   printf '\n=== starting backend :8080 ===\n'
   "$ROOT_DIR/scripts/free-port.sh" 8080
-  DATABASE_URL="$DB_URL" ./gradlew bootRun
+  DATABASE_URL="$DB_URL" ./gradlew bootRun > "$BACKEND_LOG" 2>&1 &
+  BACKEND_PID=$!
+  printf '  backend PID %s — tailing %s\n' "$BACKEND_PID" "$BACKEND_LOG"
+  printf '  waiting for :8080...\n'
+  for _i in $(seq 1 60); do
+    sleep 2
+    if lsof -ti:8080 >/dev/null 2>&1; then break; fi
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+      printf '\n  backend exited — check %s\n' "$BACKEND_LOG"
+      tail -30 "$BACKEND_LOG"
+      exit 1
+    fi
+  done
+  printf '  backend ready\n'
+
+  FRONTEND_DIR="$ROOT_DIR/../dashboard-frontend-gcp"
+  if [[ -d "$FRONTEND_DIR" ]]; then
+    printf '\n=== starting frontend :3006 ===\n'
+    cd "$FRONTEND_DIR"
+    npm install --prefer-offline 2>/dev/null || npm install
+    "$FRONTEND_DIR/scripts/free-port.sh" 3006
+    printf '  API explorer → http://localhost:3006\n'
+    printf '  Static explorer → http://localhost:8080/explorer.html\n'
+    printf '  Backend logs → tail -f %s\n\n' "$BACKEND_LOG"
+    BACKEND_URL="http://localhost:8080" npm run dev
+  else
+    printf '\n  dashboard-frontend-gcp not found — backend only\n'
+    wait "$BACKEND_PID"
+  fi
 
   exit 0
 fi
@@ -390,7 +481,7 @@ PYEOF
           --filter="state=PENDING_CREATE" \
           --format="value(name)" 2>/dev/null || true)
         if [[ -n "$_pending" ]]; then
-          printf '[deploy] Cloud SQL still creating (%s) — waiting for RUNNABLE (up to 15 min)...\n' "$_pending"
+          printf '[deploy] GCE instance still creating (%s) — waiting for RUNNABLE (up to 15 min)...\n' "$_pending"
           while (( _wait_i < 30 )); do
             _wait_i=$(( _wait_i + 1 ))
             sleep 30
@@ -401,7 +492,7 @@ PYEOF
             [[ -z "$_pending" ]] && break
             printf '  still creating... (%d/30)\n' "$_wait_i"
           done
-          printf '[deploy] Cloud SQL ready — retrying pulumi up...\n'
+          printf '[deploy] GCE instance ready — retrying pulumi up...\n'
           continue
         fi
       fi
@@ -436,7 +527,7 @@ if [[ "$DEPLOY_TARGET" == "gke" ]]; then
     --secret="${DEPLOY_MODE_PREFIX:-dash}-database-url" \
     --project "$GCP_PROJECT" >/dev/null 2>&1 && echo "yes" || echo "")
   if [[ -z "$_SECRET_EXISTS" ]]; then
-    printf '\n=== provisioning Cloud SQL + networking + secrets via Pulumi (required by GKE) ===\n'
+    printf '\n=== provisioning Postgres VM + networking + secrets via Pulumi (required by GKE) ===\n'
     cd "$ROOT_DIR/infra"
     [[ -d node_modules ]] || npm install --prefer-offline 2>/dev/null || npm install
     pulumi stack select "$DEPLOY_MODE" 2>/dev/null || pulumi stack init "$DEPLOY_MODE"
@@ -447,8 +538,8 @@ config:
   gcp:project: ${GCP_PROJECT}
   gcp:region: ${GCP_REGION}
   dashboard:namePrefix: dash-lite
-  dashboard:dbTier: db-g1-small
-  dashboard:dbDiskGb: "10"
+  dashboard:dbVmType: e2-standard-2
+  dashboard:dbDiskGb: "20"
   dashboard:minInstanceCount: "0"
   dashboard:maxInstanceCount: "1"
   dashboard:cpu: "1"
@@ -462,7 +553,7 @@ config:
   gcp:project: ${GCP_PROJECT}
   gcp:region: ${GCP_REGION}
   dashboard:namePrefix: dash
-  dashboard:dbTier: db-custom-4-16384
+  dashboard:dbVmType: n2-standard-4
   dashboard:dbDiskGb: "35"
   dashboard:minInstanceCount: "1"
   dashboard:maxInstanceCount: "5"
@@ -579,8 +670,8 @@ config:
   gcp:project: ${GCP_PROJECT}
   gcp:region: ${GCP_REGION}
   dashboard:namePrefix: dash-lite
-  dashboard:dbTier: db-g1-small
-  dashboard:dbDiskGb: "10"
+  dashboard:dbVmType: e2-standard-2
+  dashboard:dbDiskGb: "20"
   dashboard:minInstanceCount: "0"
   dashboard:maxInstanceCount: "1"
   dashboard:cpu: "1"
@@ -593,7 +684,7 @@ config:
   gcp:project: ${GCP_PROJECT}
   gcp:region: ${GCP_REGION}
   dashboard:namePrefix: dash
-  dashboard:dbTier: db-custom-4-16384
+  dashboard:dbVmType: n2-standard-4
   dashboard:dbDiskGb: "35"
   dashboard:minInstanceCount: "1"
   dashboard:maxInstanceCount: "5"
@@ -610,7 +701,7 @@ PYAML
       --format="value(status.url)" 2>/dev/null || true)
 
   cat > "$ENV_FILE" <<EOF
-CLOUD_SQL_INSTANCE=$(pulumi stack output cloudSqlInstance 2>/dev/null || true)
+DB_VM_IP=$(pulumi stack output dbVmInternalIp 2>/dev/null || true)
 ARTIFACT_REGISTRY=$(pulumi stack output artifactRegistry 2>/dev/null || true)
 CLOUD_RUN_URL=${BACKEND_URL}
 GCP_PROJECT=${GCP_PROJECT}
@@ -622,29 +713,171 @@ fi
 
 if [[ "$DEPLOY_MODE" == "lite" ]]; then
   DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo-lite.dump"
+  BAKE_VM_NAME="dash-bake-vm"
+  BAKE_VM_NETWORK="dash-lite-vpc"
+  BAKE_VM_SUBNET="dash-lite-subnet"
+  BAKE_SECRET_NAME="dash-lite-database-url"
+  S3_SOURCE_URI="s3://bikram-nextjs-subsecond-fetch-with-websockets/nextjs-dash/demo-lite.dump"
 else
   DEMO_SNAPSHOT_GCS_URI="gs://bikram-java-dash-snapshots/dash/demo.dump"
+  BAKE_VM_NAME="dash-bake-vm"
+  BAKE_VM_NETWORK="dash-vpc"
+  BAKE_VM_SUBNET="dash-subnet"
+  BAKE_SECRET_NAME="dash-database-url"
+  S3_SOURCE_URI="s3://bikram-nextjs-subsecond-fetch-with-websockets/nextjs-dash/demo.dump"
 fi
 
-_DB_URL="$("$ROOT_DIR/scripts/database-url.sh" 2>/dev/null || true)"
-if [[ -n "$_DB_URL" ]]; then
-  _TOKEN_ROWS=$(psql "$_DB_URL" -Atqc "SELECT count(*) FROM daily_customer_token_category_summary" 2>/dev/null || echo "0")
-  if [[ "$_TOKEN_ROWS" == "0" ]]; then
-    printf '\nDatabase needs seeding — running prepare-demo-data.sh (snapshot restore or full seed)...\n'
-    DEMO_SNAPSHOT_GCS_URI="$DEMO_SNAPSHOT_GCS_URI" \
-      DATABASE_URL="$_DB_URL" \
-      "$ROOT_DIR/scripts/prepare-demo-data.sh"
+printf '\nChecking database...\n'
+_API_ORDERS=""
+for _i in 1 2 3 4 5; do
+  _API_ORDERS=$(curl -sf "${BACKEND_URL}/api/orders?page=0&size=1" 2>/dev/null \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('total',0))" \
+    2>/dev/null || true)
+  [[ -n "$_API_ORDERS" ]] && break
+  printf '  waiting for backend (%d/5)...\n' "$_i"; sleep 10
+done
 
-    printf '\nRe-baking snapshot to GCS...\n'
-    DEMO_SNAPSHOT_GCS_URI="$DEMO_SNAPSHOT_GCS_URI" \
-      DATABASE_URL="$_DB_URL" \
-      "$ROOT_DIR/scripts/bake-demo-snapshot.sh"
-  else
-    printf '\nDatabase already seeded (%s token rows) — skipping seed.\n' "$_TOKEN_ROWS"
-  fi
+if [[ -z "$_API_ORDERS" ]]; then
+  printf '(Backend unreachable — skipping seed check)\n'
+elif [[ "$_API_ORDERS" != "0" ]]; then
+  printf 'Database has %s orders — skipping seed.\n' "$_API_ORDERS"
 else
-  printf '\n(Could not resolve DATABASE_URL — skipping seed check.)\n'
+  printf 'Database empty — starting VM bake...\n'
+
+  _AWS_SECRET_OK=$(gcloud secrets versions access latest \
+    --secret="dash-aws-credentials" --project="$GCP_PROJECT" >/dev/null 2>&1 && printf 'yes' || printf '')
+  if [[ -z "$_AWS_SECRET_OK" ]]; then
+    printf '\nERROR: Secret "dash-aws-credentials" not found in project %s.\n' "$GCP_PROJECT"
+    printf 'Create it once with:\n'
+    printf '  printf "AWS_ACCESS_KEY_ID=...\\nAWS_SECRET_ACCESS_KEY=...\\nAWS_DEFAULT_REGION=us-east-1" \\\n'
+    printf '    | gcloud secrets create dash-aws-credentials --data-file=- --project=%s\n' "$GCP_PROJECT"
+    printf 'Then re-run this script.\n'
+    exit 1
+  fi
+
+  gcloud compute firewall-rules describe "${BAKE_VM_NETWORK}-allow-iap-ssh" \
+    --project="$GCP_PROJECT" >/dev/null 2>&1 || \
+  gcloud compute firewall-rules create "${BAKE_VM_NETWORK}-allow-iap-ssh" \
+    --project="$GCP_PROJECT" --network="$BAKE_VM_NETWORK" \
+    --direction=INGRESS --source-ranges=35.235.240.0/20 \
+    --allow=tcp:22 --quiet
+
+  gcloud compute networks subnets update "$BAKE_VM_SUBNET" \
+    --project="$GCP_PROJECT" --region="$GCP_REGION" \
+    --enable-private-ip-google-access --quiet 2>/dev/null || true
+
+  if ! gcloud compute instances describe "$BAKE_VM_NAME" \
+      --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" \
+      --format="value(name)" >/dev/null 2>&1; then
+    printf '  Creating bake VM...\n'
+    gcloud compute instances create "$BAKE_VM_NAME" \
+      --project="$GCP_PROJECT" --zone="${GCP_REGION}-a" \
+      --machine-type=n2-standard-8 \
+      --image-family=debian-12 --image-project=debian-cloud \
+      --boot-disk-size=50GB \
+      --network="$BAKE_VM_NETWORK" --subnet="$BAKE_VM_SUBNET" \
+      --no-address --scopes=cloud-platform --quiet
+    printf '  Waiting for VM startup...\n'; sleep 30
+  fi
+
+  gcloud compute ssh "$BAKE_VM_NAME" \
+    --project="$GCP_PROJECT" --zone="${GCP_REGION}-a" \
+    --tunnel-through-iap --ssh-flag="-o ConnectTimeout=30" \
+    --command='command -v pg_restore >/dev/null 2>&1 || (
+      echo "deb http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        | sudo tee /etc/apt/sources.list.d/pgdg.list &&
+      curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg &&
+      sudo apt-get update -qq &&
+      sudo apt-get install -y postgresql-client-16 awscli
+    )' 2>/dev/null
+
+  _BAKE_SCRIPT=$(mktemp)
+  _GCS_BASENAME=$(basename "$DEMO_SNAPSHOT_GCS_URI")
+  cat > "$_BAKE_SCRIPT" << BAKE_EOF
+#!/bin/bash
+set -euo pipefail
+PROJECT="${GCP_PROJECT}"
+SECRET="${BAKE_SECRET_NAME}"
+GCS_BASENAME="${_GCS_BASENAME}"
+S3_URI="${S3_SOURCE_URI}"
+
+echo "=== fetching DB URL ==="
+TOKEN=\$(curl -sf http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+  -H Metadata-Flavor:Google | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+DB_URL=\$(curl -sf \
+  "https://secretmanager.googleapis.com/v1/projects/\${PROJECT}/secrets/\${SECRET}/versions/latest:access" \
+  -H "Authorization: Bearer \${TOKEN}" \
+  | python3 -c "import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)['payload']['data']).decode())")
+echo "DB URL resolved."
+
+echo "=== checking GCS snapshot ==="
+GCS_EXISTS=\$(curl -sf \
+  "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F\${GCS_BASENAME}" \
+  -H "Authorization: Bearer \${TOKEN}" 2>/dev/null | python3 -c "import sys,json;print('yes')" 2>/dev/null || echo "no")
+
+if [[ "\$GCS_EXISTS" == "yes" ]]; then
+  echo "=== restoring from GCS ==="
+  curl -fL \
+    "https://storage.googleapis.com/storage/v1/b/bikram-java-dash-snapshots/o/dash%2F\${GCS_BASENAME}?alt=media" \
+    -H "Authorization: Bearer \${TOKEN}" -o /tmp/bake.dump
+else
+  echo "=== GCS snapshot missing — fetching AWS creds ==="
+  AWS_SECRET_NAME="dash-aws-credentials"
+  AWS_CREDS=\$(curl -sf \
+    "https://secretmanager.googleapis.com/v1/projects/\${PROJECT}/secrets/\${AWS_SECRET_NAME}/versions/latest:access" \
+    -H "Authorization: Bearer \${TOKEN}" \
+    | python3 -c "import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)['payload']['data']).decode())")
+  export \$(echo "\$AWS_CREDS" | grep -E '^AWS_' | xargs)
+
+  echo "=== downloading from S3 ==="
+  aws s3 cp "\$S3_URI" /tmp/bake.dump
+
+  echo "=== will save to GCS after restore ==="
+  SAVE_TO_GCS="yes"
+fi
+
+echo "=== running pg_restore ==="
+pg_restore --no-owner --no-privileges --clean --if-exists \
+  -d "\$DB_URL" /tmp/bake.dump || true
+
+if [[ "\${SAVE_TO_GCS:-no}" == "yes" ]]; then
+  echo "=== saving snapshot to GCS for future deploys ==="
+  curl -sf \
+    "https://storage.googleapis.com/upload/storage/v1/b/bikram-java-dash-snapshots/o?uploadType=media&name=dash%2F\${GCS_BASENAME}" \
+    -H "Authorization: Bearer \${TOKEN}" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary @/tmp/bake.dump
+fi
+
+rm -f /tmp/bake.dump
+echo "=== done ==="
+BAKE_EOF
+
+  gcloud compute scp "$_BAKE_SCRIPT" \
+    "${BAKE_VM_NAME}:/tmp/bake.sh" \
+    --project="$GCP_PROJECT" --zone="${GCP_REGION}-a" \
+    --tunnel-through-iap --quiet 2>/dev/null
+  rm -f "$_BAKE_SCRIPT"
+
+  printf '  Running restore on VM...\n'
+  gcloud compute ssh "$BAKE_VM_NAME" \
+    --project="$GCP_PROJECT" --zone="${GCP_REGION}-a" \
+    --tunnel-through-iap --ssh-flag="-o ConnectTimeout=30" \
+    --command='bash /tmp/bake.sh' 2>/dev/null
+
+  printf '  Deleting bake VM...\n'
+  gcloud compute instances delete "$BAKE_VM_NAME" \
+    --zone="${GCP_REGION}-a" --project="$GCP_PROJECT" --quiet
+
+  printf 'Seeding complete.\n'
 fi
 
 printf '\nRemember to tear down when finished:\n'
 printf '  ./scripts/infra-down.sh\n'
+
+FRONTEND_DEPLOY="$(cd "$ROOT_DIR/../dashboard-frontend-gcp/scripts" 2>/dev/null && pwd || true)/deploy.sh"
+if [[ -f "$FRONTEND_DEPLOY" ]]; then
+  printf '\n  Deploying frontend inline...\n'
+  DEPLOY_MODE="$DEPLOY_MODE" bash "$FRONTEND_DEPLOY"
+fi
