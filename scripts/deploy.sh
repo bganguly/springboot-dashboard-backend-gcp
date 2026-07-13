@@ -33,10 +33,10 @@ printf '\n=== springboot-dashboard-backend-gcp ===\n\n'
 printf '  [1] Local  — Spring Boot on localhost + local Postgres (no GCP cost)'
 (( _local_running )) && printf ' [running]' || printf ' [not detected]'
 printf '\n'
-printf '  [2] Lite   — GCP: Cloud Run + e2-standard-2 Postgres VM (scales to zero, cold starts OK)'
+printf '  [2] Lite   — GCP: e2-medium backend VM + e2-standard-2 Postgres VM'
 (( _lite_count > 0 )) && printf ' [%s resources active]' "$_lite_count" || printf ' [not deployed]'
 printf '\n'
-printf '  [3] Full   — GCP: Cloud Run + n2-standard-4 Postgres VM (min 1 instance, always warm)'
+printf '  [3] Full   — GCP: e2-standard-2 backend VM + n2-standard-4 Postgres VM'
 (( _full_count > 0 )) && printf ' [%s resources active]' "$_full_count" || printf ' [not deployed]'
 printf '\n'
 printf '               Full also unlocks GKE deployment.\n'
@@ -51,14 +51,14 @@ esac
 if [[ "$_TARGET" == "remote" ]]; then
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     printf '\n--- Lite GCP summary ---\n'
+    printf '  Backend:    e2-medium GCE VM running Spring Boot in Docker\n'
     printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
-    printf '  Cloud Run:  min=0 instances (cold starts ~5s), max=1, 1 CPU / 512 Mi\n'
     printf '  GKE:        skipped\n'
     printf '  Cost est:   ~$50-70/mo if left running\n'
   else
     printf '\n--- Full GCP summary ---\n'
+    printf '  Backend:    e2-standard-2 GCE VM running Spring Boot in Docker\n'
     printf '  DB:         n2-standard-4 Postgres 16 VM (4 vCPU, 16 GB), 35 GB SSD\n'
-    printf '  Cloud Run:  min=1 instance (always warm), max=5, 2 CPU / 1 Gi\n'
     printf '  GKE:        available (you will be prompted)\n'
     printf '  Cost est:   ~$200-300/mo if left running — TEAR DOWN when done\n'
   fi
@@ -338,26 +338,21 @@ else
   printf '\nBuilding and pushing:\n  %s\n' "$IMAGE"
 
 if [[ "$DEPLOY_MODE" == "lite" ]]; then
-  DEPLOY_TARGET="cloudrun"
-  printf '\n  [lite] Skipping GKE — deploying to Cloud Run.\n'
+  DEPLOY_TARGET="vm"
+  printf '\n  [lite] Skipping GKE — deploying to GCE VM.\n'
 else
   _GKE_EXISTS=$(gcloud container clusters describe "${GKE_CLUSTER:-dash-gke-cluster}" \
     --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
-  _CR_EXISTS=$(gcloud run services describe dash-backend \
-    --region "$GCP_REGION" --project "$GCP_PROJECT" --format="value(name)" 2>/dev/null || true)
   if [[ -n "$_GKE_EXISTS" ]]; then
     DEPLOY_TARGET="gke"
     printf '\n  GKE cluster detected — redeploying to GKE.\n'
-  elif [[ -n "$_CR_EXISTS" ]]; then
-    DEPLOY_TARGET="cloudrun"
-    printf '\n  Cloud Run service detected — redeploying to Cloud Run.\n'
   else
     printf '\n=== STOPPED ===================================================\n'
-    printf '  Deploy to GKE (Kubernetes)?  Y = GKE  /  n = Cloud Run\n'
+    printf '  Deploy to GKE (Kubernetes)?  Y = GKE  /  n = GCE VM\n'
     printf '===============================================================\n'
     read -r -p "Deploy to GKE? [Y/n]: " _CHOICE
     case "$_CHOICE" in
-      [nN]*) DEPLOY_TARGET="cloudrun" ;;
+      [nN]*) DEPLOY_TARGET="vm" ;;
       *)     DEPLOY_TARGET="gke" ;;
     esac
     printf '\n  Target: %s\n' "$DEPLOY_TARGET"
