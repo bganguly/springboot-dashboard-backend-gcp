@@ -97,84 +97,6 @@ if [[ "$_TARGET" == "remote" ]]; then
   fi
 fi
 
-if [[ "$_TARGET" == "remote" ]]; then
-  _P_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash-full')
-  _P_CLUSTER="${_P_PREFIX}-cluster"
-  _P_ZONE="${GCP_REGION}-a"
-  _P_IS_GKE=0
-  gcloud container clusters describe "$_P_CLUSTER" \
-    --zone "$_P_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1 && _P_IS_GKE=1 || true
-
-  if (( _P_IS_GKE )); then
-    _P_NODES=$(gcloud container clusters describe "$_P_CLUSTER" \
-      --zone "$_P_ZONE" --project "$GCP_PROJECT" \
-      --format="value(currentNodeCount)" 2>/dev/null || echo "?")
-    printf '\n  Current: GKE · nodes=%s\n' "$_P_NODES"
-  else
-    _P_CR_MIN=$(gcloud run services describe "${_P_PREFIX}-backend" \
-      --region "$GCP_REGION" --project "$GCP_PROJECT" \
-      --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])" \
-      2>/dev/null || echo "?")
-    printf '\n  Current: Cloud Run · min-instances=%s\n' "${_P_CR_MIN:-0}"
-  fi
-
-  printf '  Auto-schedule: starts 8am · stops 5pm · weekdays Pacific.\n'
-  printf '  [1] Start now  [2] Stop now  [3] Suspend schedule  [4] Resume schedule  [enter] Continue deploy: '
-  read -r _PRE_ACTION
-  case "${_PRE_ACTION:-}" in
-    1)
-      if (( _P_IS_GKE )); then
-        printf '  Starting — GKE node pool → 1...\n'
-        gcloud container clusters resize "$_P_CLUSTER" \
-          --node-pool default-pool --num-nodes 1 \
-          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
-        printf '  Node coming up — Spring Boot ready in ~2-3 min.\n'
-      else
-        gcloud scheduler jobs run "${_P_PREFIX}-scale-up-backend" \
-          --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
-          && printf '  Started — Cloud Run min-instances now 1.\n' \
-          || printf '  (scheduler job not yet created — will exist after first deploy)\n'
-      fi
-      ;;
-    2)
-      if (( _P_IS_GKE )); then
-        printf '  Stopping — GKE node pool → 0...\n'
-        gcloud container clusters resize "$_P_CLUSTER" \
-          --node-pool default-pool --num-nodes 0 \
-          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
-        printf '  Stopped — no node charges until next start.\n'
-      else
-        gcloud scheduler jobs run "${_P_PREFIX}-scale-down-backend" \
-          --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
-          && printf '  Stopped — Cloud Run min-instances now 0.\n' \
-          || printf '  (scheduler job not yet created — will exist after first deploy)\n'
-      fi
-      ;;
-    3)
-      if (( _P_IS_GKE )); then
-        gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      else
-        gcloud scheduler jobs pause "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs pause "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      fi
-      printf '  Schedule suspended.\n'
-      ;;
-    4)
-      if (( _P_IS_GKE )); then
-        gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      else
-        gcloud scheduler jobs resume "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs resume "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      fi
-      printf '  Schedule resumed.\n'
-      ;;
-    *)
-      ;;
-  esac
-fi
-
 # ══════════════════════════════════════════════════════════════════════════════
 # LOCAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -405,6 +327,84 @@ TAG="${TAG:-$(date +%Y%m%d%H%M%S)}"
 
 printf '\n=== deployment config ===\n'
 printf '  Project: %s\n  Region:  %s\n' "$GCP_PROJECT" "$GCP_REGION"
+
+if [[ "$_TARGET" == "remote" ]]; then
+  _P_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash-full')
+  _P_CLUSTER="${_P_PREFIX}-cluster"
+  _P_ZONE="${GCP_REGION}-a"
+  _P_IS_GKE=0
+  gcloud container clusters describe "$_P_CLUSTER" \
+    --zone "$_P_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1 && _P_IS_GKE=1 || true
+
+  if (( _P_IS_GKE )); then
+    _P_NODES=$(gcloud container clusters describe "$_P_CLUSTER" \
+      --zone "$_P_ZONE" --project "$GCP_PROJECT" \
+      --format="value(currentNodeCount)" 2>/dev/null || echo "?")
+    printf '  Current: GKE · nodes=%s\n' "$_P_NODES"
+  else
+    _P_CR_MIN=$(gcloud run services describe "${_P_PREFIX}-backend" \
+      --region "$GCP_REGION" --project "$GCP_PROJECT" \
+      --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])" \
+      2>/dev/null || echo "?")
+    printf '  Current: Cloud Run · min-instances=%s\n' "${_P_CR_MIN:-0}"
+  fi
+
+  printf '  Auto-schedule: starts 8am · stops 5pm · weekdays Pacific.\n'
+  printf '  [1] Start now  [2] Stop now  [3] Suspend schedule  [4] Resume schedule  [enter] Continue: '
+  read -r _PRE_ACTION
+  case "${_PRE_ACTION:-}" in
+    1)
+      if (( _P_IS_GKE )); then
+        printf '  Starting — GKE node pool → 1...\n'
+        gcloud container clusters resize "$_P_CLUSTER" \
+          --node-pool default-pool --num-nodes 1 \
+          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
+        printf '  Node coming up — Spring Boot ready in ~2-3 min.\n'
+      else
+        gcloud scheduler jobs run "${_P_PREFIX}-scale-up-backend" \
+          --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
+          && printf '  Started — Cloud Run min-instances now 1.\n' \
+          || printf '  (scheduler job not yet created — will exist after first deploy)\n'
+      fi
+      ;;
+    2)
+      if (( _P_IS_GKE )); then
+        printf '  Stopping — GKE node pool → 0...\n'
+        gcloud container clusters resize "$_P_CLUSTER" \
+          --node-pool default-pool --num-nodes 0 \
+          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
+        printf '  Stopped — no node charges until next start.\n'
+      else
+        gcloud scheduler jobs run "${_P_PREFIX}-scale-down-backend" \
+          --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
+          && printf '  Stopped — Cloud Run min-instances now 0.\n' \
+          || printf '  (scheduler job not yet created — will exist after first deploy)\n'
+      fi
+      ;;
+    3)
+      if (( _P_IS_GKE )); then
+        gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+        gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+      else
+        gcloud scheduler jobs pause "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+        gcloud scheduler jobs pause "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+      fi
+      printf '  Schedule suspended.\n'
+      ;;
+    4)
+      if (( _P_IS_GKE )); then
+        gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+        gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+      else
+        gcloud scheduler jobs resume "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+        gcloud scheduler jobs resume "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
+      fi
+      printf '  Schedule resumed.\n'
+      ;;
+    *)
+      ;;
+  esac
+fi
 
 printf '  Checking Artifact Registry API...\n'
 AR_STATE=$(gcloud services list \
