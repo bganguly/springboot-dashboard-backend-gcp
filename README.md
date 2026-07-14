@@ -1,8 +1,9 @@
 # Dashboard Backend — Spring Boot + GCP Cloud Run
 
 Production-grade **Java 21 / Spring Boot 4** REST API delivering sub-second responses across
-4 million orders: full-text trigram search, pre-aggregated analytics tables, serverless autoscaling,
-and declarative Pulumi IaC on GCP.
+4 million orders: full-text search, pre-aggregated analytics tables, serverless autoscaling,
+and declarative Pulumi IaC on GCP. Supports both Cloud Run and GKE as backend runtimes with
+container images stored in Artifact Registry (analogous to ECR + ECS/EKS in AWS deployments).
 
 Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-frontend-gcp)
 
@@ -11,15 +12,15 @@ Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-fron
 | | |
 |---|---|
 | **Java / Spring Boot back-end** | Spring Boot 4, Java 21, NamedParameterJdbcTemplate, Flyway |
-| **PostgreSQL — SQL, DML/DDL, performance tuning** | GCE VM Postgres 16; Flyway DDL migrations; GIN trigram index; pre-aggregated summary tables for sub-second chart queries on 4 M rows |
-| **Serverless / cloud-native computing** | Cloud Run (default) or GKE — min-instances: 0, scales to zero, Direct VPC Egress to private Postgres; toggled via `BACKEND_RUNTIME` |
+| **PostgreSQL — SQL, DML/DDL, performance tuning** | GCE VM Postgres 16; Flyway DDL migrations; GIN index; pre-aggregated summary tables for sub-second chart queries on 4 M rows |
+| **Serverless / cloud-native computing** | Cloud Run (default) or GKE — images in Artifact Registry; min-instances: 0, scales to zero, Direct VPC Egress to private Postgres; toggled via `BACKEND_RUNTIME` |
 | **IaC (Terraform equivalent)** | Pulumi TypeScript (`infra/index.ts`) — VPC, GCE Postgres VM, Cloud Run service, IAM, Secret Manager, Artifact Registry all declared |
 | **CI/CD pipelines** | `deploy.sh` — build → push to Artifact Registry → `pulumi up --yes`; auto bake via ephemeral GCE VM when DB is empty |
 | **Secrets management** | GCP Secret Manager; `DATABASE_URL` injected at runtime via `secretKeyRef`, never stored in image or env file |
 | **Networking, storage, DB architecture** | Private VPC, Direct VPC Egress, GCE VM Postgres on private IP (VPC firewall rules), pg-SSD boot disk |
 | **BFF / integration layer** | Nginx frontend proxies `/api/*` to Cloud Run backend (TLS + SNI); Spring Boot orchestrates REST + DB |
 | **RESTful APIs / microservices** | Two independent Cloud Run services; paginated list endpoint + aggregates endpoint |
-| **Performance optimization** | Sub-second ILIKE search on 4 M rows via GIN trigram index; pre-aggregated daily tables cut chart query time from seconds to milliseconds |
+| **Performance optimization** | Sub-second ILIKE search on 4 M rows via GIN index; pre-aggregated daily tables cut chart query time from seconds to milliseconds |
 | **System design diagrams** | See architecture section below |
 
 ---
@@ -27,7 +28,7 @@ Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-fron
 
 ## Scale & Performance
 
-> **4 M+ orders** in Cloud SQL PostgreSQL 16 — sub-second full-text search via GIN trigram index on a denormalized `search_text` column; millisecond chart aggregates via pre-aggregated summary tables; zero sequential scans on the hot path.
+> **4 M+ orders** in Cloud SQL PostgreSQL 16 — sub-second full-text search via GIN index on a denormalized `search_text` column; millisecond chart aggregates via pre-aggregated summary tables; zero sequential scans on the hot path.
 
 ```
 Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──► Spring Boot (CR or GKE) ──VPC──► GCE VM: Postgres 16
@@ -125,9 +126,8 @@ curl "$BASE/api/orders?page=1&size=3" | jq .total
 │                                │  GCE VM: Postgres 16  │               │
 │                                │  dash-lite-pg         │               │
 │                                │  • orders (4 M rows)  │               │
-│                                │  • GIN trigram index  │               │
+│                                │  • GIN index          │               │
 │                                │  • pre-agg summary    │               │
-│                                │  • pg_bigm extension  │               │
 │                                └───────────────────────┘               │
 │                                                                         │
 │   Secret Manager                                                        │
@@ -163,8 +163,52 @@ deploy.sh (auto) or scripts/bake-demo-snapshot.sh
 
 | Concern | Approach |
 |---|---|
-| **Search performance** | Denormalized `search_text` column (name + notes + total + id + status + region + date) with one GIN trigram index — sub-second ILIKE on 4 M rows, single index hit per token, no cross-table OR |
+| **Search performance** | Denormalized `search_text` column (name + notes + total + id + status + region + date) with one GIN index — sub-second ILIKE on 4 M rows, single index hit per token, no cross-table OR |
 | **Chart performance** | Pre-aggregated `daily_summary`, `daily_customer_category_summary`, `daily_status_category_summary`, `daily_filter_category_summary` — sub-second chart aggregates, queries never touch raw `orders` |
 | **Trigger maintenance** | `fn_order_search_text()` (BEFORE INSERT/UPDATE on orders) + `fn_customer_name_to_orders()` (AFTER UPDATE on customers) keep `search_text` current without application-level logic |
 | **Startup resilience** | Cloud Run startup probe with `failureThreshold: 60` × `periodSeconds: 15` = 15 min — survives long Flyway migrations (e.g. UPDATE + CREATE INDEX on 4 M rows) |
 | **Zero-credential deploys** | Backend SA with `roles/secretmanager.secretAccessor` + `roles/cloudsql.client`; no passwords in code or Docker image |
+
+---
+
+## Snapshot Data
+
+Demo data is seeded from a pre-built PostgreSQL dump stored in GCS:
+
+```
+gs://bikram-java-dash-snapshots/dash/demo-lite.dump
+```
+
+`deploy.sh` automatically triggers a restore when the `orders` table is empty:
+
+1. Creates an ephemeral n2-standard-8 bake VM on the same VPC.
+2. Runs `pg_restore` from the GCS snapshot into the GCE Postgres instance.
+3. Deletes the bake VM on completion.
+
+To manually trigger a restore:
+
+```bash
+./scripts/bake-demo-snapshot.sh
+```
+
+The snapshot contains 4 M+ orders across multiple customers, regions, and statuses — sized for realistic query performance testing without needing to generate synthetic data.
+
+---
+
+## Transactional Outbox
+
+The backend uses database-level triggers to maintain consistency between the `orders` table and its derived state — a pattern analogous to the transactional outbox, but enforced at the DB layer rather than application code.
+
+| Trigger | Event | Effect |
+|---|---|---|
+| `fn_order_search_text()` | BEFORE INSERT/UPDATE on `orders` | Recomputes `search_text` from name, notes, total, id, status, region, date |
+| `fn_customer_name_to_orders()` | AFTER UPDATE on `customers` | Propagates customer name changes to all matching `orders.search_text` |
+
+This ensures:
+- `search_text` is always current — the GIN index is never stale relative to the underlying row.
+- Customer renames propagate atomically across all orders within the same transaction.
+- No separate background sync process is required for search consistency.
+
+The pre-aggregated summary tables (`daily_summary`, `daily_customer_category_summary`, `daily_status_category_summary`, `daily_filter_category_summary`) are populated via controlled application writes on order insert/update, keeping chart aggregates in sync without touching raw `orders` on the query path.
+
+For future event-driven extensions (e.g. publishing order state changes to an external message broker), this project is structured to adopt a true transactional outbox table: write the event to an `outbox` table in the same DB transaction as the order write, then have a separate relay process poll and publish — guaranteeing at-least-once delivery even if the broker is temporarily unavailable.
