@@ -4,7 +4,9 @@ set -euo pipefail
 TIER="${TIER:-lite}"
 PROJECT="bikram-java"
 LOCATION="us-central1"
+ZONE="${LOCATION}-a"
 PREFIX="dash-${TIER}"
+CLUSTER="${PREFIX}-cluster"
 CMD="${1:-}"
 
 usage() {
@@ -14,30 +16,57 @@ usage() {
 
 [[ -z "$CMD" ]] && usage
 
+_is_gke() {
+  gcloud container clusters describe "$CLUSTER" \
+    --zone "$ZONE" --project "$PROJECT" >/dev/null 2>&1
+}
+
 case "$CMD" in
   up)
-    gcloud scheduler jobs run "${PREFIX}-scale-up-backend" \
-      --location "$LOCATION" --project "$PROJECT"
-    printf 'Scaled up: %s-backend now has min=1.\n' "$PREFIX"
+    if _is_gke; then
+      printf 'GKE mode — scaling node pool to 1...\n'
+      gcloud container clusters resize "$CLUSTER" \
+        --node-pool default-pool --num-nodes 1 \
+        --zone "$ZONE" --project "$PROJECT" --quiet
+      printf 'Node coming up; pod will schedule automatically (~2-3 min for Spring Boot).\n'
+    else
+      gcloud scheduler jobs run "${PREFIX}-scale-up-backend" \
+        --location "$LOCATION" --project "$PROJECT"
+      printf 'Scaled up: %s-backend min-instances=1.\n' "$PREFIX"
+    fi
     ;;
   down)
-    gcloud scheduler jobs run "${PREFIX}-scale-down-backend" \
-      --location "$LOCATION" --project "$PROJECT"
-    printf 'Scaled down: %s-backend now has min=0.\n' "$PREFIX"
+    if _is_gke; then
+      printf 'GKE mode — scaling node pool to 0...\n'
+      gcloud container clusters resize "$CLUSTER" \
+        --node-pool default-pool --num-nodes 0 \
+        --zone "$ZONE" --project "$PROJECT" --quiet
+      printf 'Node pool scaled to 0. No node charges until next scale-up.\n'
+    else
+      gcloud scheduler jobs run "${PREFIX}-scale-down-backend" \
+        --location "$LOCATION" --project "$PROJECT"
+      printf 'Scaled down: %s-backend min-instances=0.\n' "$PREFIX"
+    fi
     ;;
   pause)
-    gcloud scheduler jobs pause "${PREFIX}-scale-up-backend" \
-      --location "$LOCATION" --project "$PROJECT"
-    gcloud scheduler jobs pause "${PREFIX}-scale-down-backend" \
-      --location "$LOCATION" --project "$PROJECT"
-    printf 'Schedule paused for %s-backend.\n' "$PREFIX"
+    if _is_gke; then
+      gcloud scheduler jobs pause "${PREFIX}-gke-scale-up"   --location "$LOCATION" --project "$PROJECT"
+      gcloud scheduler jobs pause "${PREFIX}-gke-scale-down" --location "$LOCATION" --project "$PROJECT"
+    else
+      gcloud scheduler jobs pause "${PREFIX}-scale-up-backend"   --location "$LOCATION" --project "$PROJECT"
+      gcloud scheduler jobs pause "${PREFIX}-scale-down-backend" --location "$LOCATION" --project "$PROJECT"
+    fi
+    printf 'Schedule paused for %s.\n' "$PREFIX"
     ;;
   resume)
-    gcloud scheduler jobs resume "${PREFIX}-scale-up-backend" \
-      --location "$LOCATION" --project "$PROJECT"
-    gcloud scheduler jobs resume "${PREFIX}-scale-down-backend" \
-      --location "$LOCATION" --project "$PROJECT"
-    printf 'Schedule resumed for %s-backend.\n' "$PREFIX"
+    if _is_gke; then
+      gcloud scheduler jobs resume "${PREFIX}-gke-scale-up"   --location "$LOCATION" --project "$PROJECT"
+      gcloud scheduler jobs resume "${PREFIX}-gke-scale-down" --location "$LOCATION" --project "$PROJECT"
+    else
+      gcloud scheduler jobs resume "${PREFIX}-scale-up-backend"   --location "$LOCATION" --project "$PROJECT"
+      gcloud scheduler jobs resume "${PREFIX}-scale-down-backend" --location "$LOCATION" --project "$PROJECT"
+    fi
+    printf 'Schedule resumed for %s.\n' "$PREFIX"
     ;;
   *)
     usage

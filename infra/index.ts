@@ -22,6 +22,7 @@ const apis = [
   "secretmanager.googleapis.com",
   "run.googleapis.com",
   "cloudscheduler.googleapis.com",
+  "container.googleapis.com",
 ].map(api => new gcp.projects.Service(`api-${api.split(".")[0]}`, {
   project,
   service: api,
@@ -177,7 +178,7 @@ if (backendRuntime !== "gke") {
           tcpSocket: { port: 8080 },
           initialDelaySeconds: 10,
           periodSeconds: 15,
-          failureThreshold: 60,
+          failureThreshold: namePrefix.includes("full") ? 200 : 60,
           timeoutSeconds: 5,
         },
       }],
@@ -251,6 +252,55 @@ if (backendRuntime !== "gke") {
   }, { dependsOn: apis });
 
   _backendUrl = backendService.uri;
+}
+
+// ── GKE node-pool scheduler (gke mode only, weekdays 8am–5pm Pacific) ────────
+if (backendRuntime === "gke") {
+  const _gkeZone    = `${region}-a`;
+  const _gkeCluster = `${namePrefix}-cluster`;
+  const _resizeUri  = `https://container.googleapis.com/v1/projects/${project}/zones/${_gkeZone}/clusters/${_gkeCluster}/nodePools/default-pool/setSize`;
+
+  const gkeSchedSa = new gcp.serviceaccount.Account("gke-sched-sa", {
+    accountId: `${namePrefix}-gke-sched-sa`,
+    displayName: "GKE node-pool scheduler",
+  });
+
+  new gcp.projects.IAMMember("gke-sched-cluster-admin", {
+    project,
+    role: "roles/container.clusterAdmin",
+    member: pulumi.interpolate`serviceAccount:${gkeSchedSa.email}`,
+  });
+
+  const _nodeUp   = Buffer.from(JSON.stringify({ nodeCount: 1 })).toString("base64");
+  const _nodeDown = Buffer.from(JSON.stringify({ nodeCount: 0 })).toString("base64");
+
+  new gcp.cloudscheduler.Job("gke-scale-up", {
+    name: `${namePrefix}-gke-scale-up`,
+    region,
+    schedule: "0 8 * * 1-5",
+    timeZone: "America/Los_Angeles",
+    httpTarget: {
+      uri: _resizeUri,
+      httpMethod: "POST",
+      body: _nodeUp,
+      headers: { "Content-Type": "application/json" },
+      oidcToken: { serviceAccountEmail: gkeSchedSa.email, audience: "https://container.googleapis.com/" },
+    },
+  }, { dependsOn: apis });
+
+  new gcp.cloudscheduler.Job("gke-scale-down", {
+    name: `${namePrefix}-gke-scale-down`,
+    region,
+    schedule: "0 17 * * 1-5",
+    timeZone: "America/Los_Angeles",
+    httpTarget: {
+      uri: _resizeUri,
+      httpMethod: "POST",
+      body: _nodeDown,
+      headers: { "Content-Type": "application/json" },
+      oidcToken: { serviceAccountEmail: gkeSchedSa.email, audience: "https://container.googleapis.com/" },
+    },
+  }, { dependsOn: apis });
 }
 
 // ── Outputs ───────────────────────────────────────────────────────────────────
