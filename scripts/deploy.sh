@@ -1150,4 +1150,39 @@ if [[ "$_TARGET" == "remote" ]]; then
   if [[ "$DEPLOY_MODE" == "full" ]]; then
     printf '\n  !! REMINDER: FULL MODE IS RUNNING (~$200-300/mo) — RUN infra-down.sh WHEN DONE\n'
   fi
+
+  printf '\n  Schedule: backend scales up 8am / down 5pm Pacific weekdays (auto).\n'
+  printf '  Override now? [1] Start now  [2] Stop now  [enter] Do nothing: '
+  read -r _SCALE_NOW
+  case "${_SCALE_NOW:-}" in
+    1)
+      if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+        printf '  Scaling GKE node pool to 1...\n'
+        gcloud container clusters resize "$_GKE_CLUSTER" \
+          --node-pool default-pool --num-nodes 1 \
+          --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet
+        printf '  Node coming up — Spring Boot ready in ~2-3 min.\n'
+      else
+        gcloud scheduler jobs run "${DEPLOY_MODE_PREFIX}-scale-up-backend" \
+          --location "$GCP_REGION" --project "$GCP_PROJECT"
+        printf '  Cloud Run min-instances set to 1.\n'
+      fi
+      ;;
+    2)
+      if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+        printf '  Scaling GKE node pool to 0...\n'
+        gcloud container clusters resize "$_GKE_CLUSTER" \
+          --node-pool default-pool --num-nodes 0 \
+          --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet
+        printf '  Node pool at 0. No charges until next scale-up.\n'
+      else
+        gcloud scheduler jobs run "${DEPLOY_MODE_PREFIX}-scale-down-backend" \
+          --location "$GCP_REGION" --project "$GCP_PROJECT"
+        printf '  Cloud Run min-instances set to 0.\n'
+      fi
+      ;;
+    *)
+      printf '  No change.\n'
+      ;;
+  esac
 fi
