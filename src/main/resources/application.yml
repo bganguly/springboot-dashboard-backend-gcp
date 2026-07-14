@@ -21,6 +21,19 @@ spring:
 server:
   port: ${PORT:8080}
 
+management:
+  info:
+    env:
+      enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+info:
+  backend:
+    runtime: ${BACKEND_RUNTIME:cr}
+
 logging:
   level:
     com.dashboard: INFO
