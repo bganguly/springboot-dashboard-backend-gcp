@@ -61,7 +61,7 @@ TIER=full ./scripts/scale.sh up
 | | URL |
 |---|---|
 | **App** | https://dash-lite-frontend-77y7e2wykq-uc.a.run.app |
-| **Backend API (direct)** | http://136.110.209.65 |
+| **Backend API (direct)** | http://34.61.244.253 |
 
 ```bash
 # local

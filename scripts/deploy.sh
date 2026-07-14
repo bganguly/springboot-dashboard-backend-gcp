@@ -957,15 +957,15 @@ fi
       --project "$GCP_PROJECT" \
       --substitutions "_IMAGE=${IMAGE},_CLUSTER=${_GKE_CLUSTER},_ZONE=${_GKE_ZONE},_NAMESPACE=${_GKE_NS},_STARTUP_THRESHOLD=${_GKE_STARTUP_THRESHOLD}" \
       "${ROOT_DIR}/k8s"
-    printf '  Waiting for GCE Ingress IP (can take 5-10 min)...\n'
+    printf '  Waiting for LoadBalancer IP...\n'
     gcloud container clusters get-credentials "$_GKE_CLUSTER" \
       --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
     _LB_IP=""
     for _i in $(seq 1 60); do
-      _LB_IP=$(kubectl get ingress "${_GKE_NS}-backend" -n "$_GKE_NS" \
+      _LB_IP=$(kubectl get svc "${_GKE_NS}-backend" -n "$_GKE_NS" \
         -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
       [[ -n "$_LB_IP" ]] && break
-      printf '  waiting for Ingress IP (%d/60)...\n' "$_i"; sleep 10
+      printf '  waiting for LoadBalancer (%d/60)...\n' "$_i"; sleep 10
     done
     BACKEND_URL="http://${_LB_IP}"
   else
