@@ -80,19 +80,21 @@ _do_scale() {
 }
 
 _menu() {
-  printf '\n=== scale.sh — %s (%s) ===\n\n' "$PREFIX" "$(if _is_gke; then printf 'GKE · nodes=%s' "$(_gke_nodes)"; else printf 'Cloud Run · min=%s' "$(_cr_min)"; fi)"
-  printf '  [1] Scale up now    — bring backend online immediately\n'
-  printf '  [2] Scale down now  — stop node / drop to zero (saves cost)\n'
-  printf '  [3] Pause schedule  — disable the 8am/5pm auto-schedule\n'
-  printf '  [4] Resume schedule — re-enable the 8am/5pm auto-schedule\n'
+  printf '\n=== scale.sh — %s (%s) ===\n' "$PREFIX" "$(if _is_gke; then printf 'GKE · nodes=%s' "$(_gke_nodes)"; else printf 'Cloud Run · min=%s' "$(_cr_min)"; fi)"
+  printf '  Auto-schedule: starts 8am · stops 5pm · weekdays Pacific.\n\n'
+  printf '  [1] Start now        — bring backend online immediately\n'
+  printf '  [2] Stop now         — take backend offline (no charges)\n'
+  printf '  [3] Suspend schedule — disable the 8am/5pm auto-schedule\n'
+  printf '  [4] Resume schedule  — re-enable the 8am/5pm auto-schedule\n'
+  printf '  [enter] Do nothing\n'
   printf '\nChoice [1/2/3/4]: '
   read -r _CHOICE
-  case "$_CHOICE" in
+  case "${_CHOICE:-}" in
     1) _do_scale up     ;;
     2) _do_scale down   ;;
     3) _do_scale pause  ;;
     4) _do_scale resume ;;
-    *) printf 'Cancelled.\n' ;;
+    *) printf 'No change.\n' ;;
   esac
 }
 
