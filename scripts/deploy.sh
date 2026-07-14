@@ -67,16 +67,26 @@ fi
 if [[ "$_TARGET" == "remote" ]]; then
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     printf '\n--- Lite GCP summary ---\n'
-    printf '  Backend:    Cloud Run (min-instances: 0, scales to zero)\n'
-    printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
-    printf '  Cost est:   ~$17/mo if left running (DB VM dominates)\n'
+    if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+      printf '  Backend:    GKE (e2-standard-4 node, always-on)\n'
+      printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
+      printf '  Cost est:   ~$65/mo if left running (e2-standard-4 GKE node + e2-standard-2 DB VM)\n'
+    else
+      printf '  Backend:    Cloud Run (min-instances: 0, scales to zero)\n'
+      printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
+      printf '  Cost est:   ~$17/mo if left running (DB VM dominates)\n'
+    fi
   else
     printf '\n'
     printf '  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n'
     printf '  !!                                                        !!\n'
     printf '  !!   FULL MODE SELECTED — THIS IS EXPENSIVE               !!\n'
     printf '  !!                                                        !!\n'
+    if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+    printf '  !!   Backend:  GKE (e2-standard-2 node, always-on)       !!\n'
+    else
     printf '  !!   Backend:  Cloud Run (min-instances: 0)              !!\n'
+    fi
     printf '  !!   DB:       n2-standard-4 Postgres VM (4 vCPU, 16 GB) !!\n'
     printf '  !!   Cost est: ~$200-300/mo — TEAR DOWN WHEN DONE        !!\n'
     printf '  !!                                                        !!\n'
@@ -318,16 +328,18 @@ TAG="${TAG:-$(date +%Y%m%d%H%M%S)}"
 printf '\n=== deployment config ===\n'
 printf '  Project: %s\n  Region:  %s\n' "$GCP_PROJECT" "$GCP_REGION"
 
+printf '  Checking Artifact Registry API...\n'
 AR_STATE=$(gcloud services list \
   --project="$GCP_PROJECT" \
   --filter="name:artifactregistry.googleapis.com" \
   --format="value(state)" 2>/dev/null || true)
 
 if [[ "$AR_STATE" != "ENABLED" ]]; then
-  printf '\n  Enabling Artifact Registry API for project %s...\n' "$GCP_PROJECT"
+  printf '  Enabling Artifact Registry API for project %s...\n' "$GCP_PROJECT"
   gcloud services enable artifactregistry.googleapis.com --project="$GCP_PROJECT"
 fi
 
+printf '  Resolving Artifact Registry repo...\n'
 _LISTED_REGISTRY=$(gcloud artifacts repositories list \
   --project="$GCP_PROJECT" \
   --location="$GCP_REGION" \
@@ -337,7 +349,7 @@ REGISTRY="${_LISTED_REGISTRY:-${ARTIFACT_REGISTRY:-${GCP_PROJECT}-gradle}}"
 
 if ! gcloud artifacts repositories describe "$REGISTRY" \
       --project="$GCP_PROJECT" --location="$GCP_REGION" >/dev/null 2>&1; then
-  printf '\n  No Artifact Registry repo found — creating "%s" in %s...\n' "$REGISTRY" "$GCP_REGION"
+  printf '  No Artifact Registry repo found — creating "%s" in %s...\n' "$REGISTRY" "$GCP_REGION"
   gcloud artifacts repositories create "$REGISTRY" \
     --repository-format=docker \
     --location="$GCP_REGION" \
@@ -346,7 +358,7 @@ fi
 
 IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REGISTRY}/backend:${TAG}"
 
-
+printf '  Checking if image tag %s exists...\n' "$TAG"
 _IMG_EXISTS=$(gcloud artifacts docker tags list \
   "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${REGISTRY}/backend" \
   --filter="tag=${TAG}" \
@@ -404,8 +416,9 @@ else
 fi
 fi
 
+printf '  Checking Application Default Credentials...\n'
 if ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
-  printf '\nSetting up Application Default Credentials (required by the Pulumi GCP provider)...\n'
+  printf '  Setting up Application Default Credentials (required by the Pulumi GCP provider)...\n'
   gcloud auth application-default login
 fi
 
@@ -891,39 +904,68 @@ BAKE_EOF
   fi
 fi
 
+  if [[ "$BACKEND_RUNTIME" != "gke" ]]; then
+    _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
+    _GKE_ZONE="${GCP_REGION}-a"
+    if gcloud container clusters describe "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+      printf '  Tearing down GKE cluster %s (switched to Cloud Run)...\n' "$_GKE_CLUSTER"
+      gcloud container clusters delete "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    fi
+  fi
+
   if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
     _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
     _GKE_ZONE="${GCP_REGION}-a"
     _GKE_NS="${DEPLOY_MODE_PREFIX}"
+    _GKE_MACHINE_TYPE="e2-standard-4"
     gcloud services enable container.googleapis.com --project "$GCP_PROJECT" 2>/dev/null || true
+    if gcloud container clusters describe "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+      _EXISTING_TYPE=$(gcloud container clusters describe "$_GKE_CLUSTER" \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
+        --format="value(nodePools[0].config.machineType)" 2>/dev/null || true)
+      if [[ "$_EXISTING_TYPE" != "$_GKE_MACHINE_TYPE" ]]; then
+        printf '  GKE cluster machine type is %s, need %s — recreating...\n' "$_EXISTING_TYPE" "$_GKE_MACHINE_TYPE"
+        gcloud container clusters delete "$_GKE_CLUSTER" \
+          --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+      else
+        printf '  GKE cluster %s already exists (%s).\n' "$_GKE_CLUSTER" "$_GKE_MACHINE_TYPE"
+        gcloud container clusters get-credentials "$_GKE_CLUSTER" \
+          --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+      fi
+    fi
     if ! gcloud container clusters describe "$_GKE_CLUSTER" \
         --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
-      printf '\n  Creating GKE cluster %s (e2-standard-2, 1 node)...\n' "$_GKE_CLUSTER"
+      printf '\n  Creating GKE cluster %s (%s, 1 node)...\n' "$_GKE_CLUSTER" "$_GKE_MACHINE_TYPE"
       gcloud container clusters create "$_GKE_CLUSTER" \
         --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
-        --machine-type e2-standard-2 --num-nodes 1 \
+        --machine-type "$_GKE_MACHINE_TYPE" --num-nodes 1 \
         --network "${DEPLOY_MODE_PREFIX}-vpc" \
         --subnetwork "${DEPLOY_MODE_PREFIX}-subnet" \
         --quiet
-    else
-      printf '  GKE cluster %s already exists.\n' "$_GKE_CLUSTER"
-      gcloud container clusters get-credentials "$_GKE_CLUSTER" \
-        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
     fi
+    _STEP="gke deploy"
+    _GKE_STARTUP_THRESHOLD=60
+    [[ "$DEPLOY_MODE" == "full" ]] && _GKE_STARTUP_THRESHOLD=200
     printf '\n  Deploying to GKE via Cloud Build...\n'
-    gcloud builds submit --config cloudbuild-gke.yaml \
+    printf '  (tail pod logs in another terminal):\n'
+    printf '    gcloud container clusters get-credentials %s --zone %s --project %s\n' "$_GKE_CLUSTER" "$_GKE_ZONE" "$GCP_PROJECT"
+    printf '    kubectl logs -n %s -l app=%s-backend -f --tail=50\n\n' "$_GKE_NS" "$_GKE_NS"
+    gcloud builds submit --config "${ROOT_DIR}/cloudbuild-gke.yaml" \
       --project "$GCP_PROJECT" \
-      --substitutions "_IMAGE=${IMAGE},_CLUSTER=${_GKE_CLUSTER},_ZONE=${_GKE_ZONE},_NAMESPACE=${_GKE_NS}" \
-      --no-source
-    printf '  Waiting for LoadBalancer IP...\n'
+      --substitutions "_IMAGE=${IMAGE},_CLUSTER=${_GKE_CLUSTER},_ZONE=${_GKE_ZONE},_NAMESPACE=${_GKE_NS},_STARTUP_THRESHOLD=${_GKE_STARTUP_THRESHOLD}" \
+      "${ROOT_DIR}/k8s"
+    printf '  Waiting for GCE Ingress IP (can take 5-10 min)...\n'
     gcloud container clusters get-credentials "$_GKE_CLUSTER" \
       --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
     _LB_IP=""
-    for _i in $(seq 1 30); do
-      _LB_IP=$(kubectl get svc "${_GKE_NS}-backend" -n "$_GKE_NS" \
+    for _i in $(seq 1 60); do
+      _LB_IP=$(kubectl get ingress "${_GKE_NS}-backend" -n "$_GKE_NS" \
         -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
       [[ -n "$_LB_IP" ]] && break
-      printf '  waiting for LoadBalancer (%d/30)...\n' "$_i"; sleep 10
+      printf '  waiting for Ingress IP (%d/60)...\n' "$_i"; sleep 10
     done
     BACKEND_URL="http://${_LB_IP}"
   else
