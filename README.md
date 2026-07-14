@@ -77,7 +77,7 @@ One-liners still work: `TIER=lite ./scripts/scale.sh up` / `down`
 | | URL |
 |---|---|
 | **App** | https://dash-lite-frontend-77y7e2wykq-uc.a.run.app |
-| **Backend API (direct)** | http://34.61.244.253 |
+| **Backend API (direct)** | http:// |
 
 ```bash
 # local
