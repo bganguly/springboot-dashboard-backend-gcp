@@ -5,7 +5,13 @@ Production-grade **Java 21 / Spring Boot 4** REST API delivering sub-second resp
 and declarative Pulumi IaC on GCP. Supports both Cloud Run and GKE as backend runtimes with
 container images stored in Artifact Registry (analogous to ECR + ECS/EKS in AWS deployments).
 
-Sister repo: [dashboard-frontend-gcp](https://github.com/bganguly/dashboard-frontend-gcp)
+**[→ Portfolio demo](https://bganguly.github.io/?open=dashboard)**
+
+## Using the App
+
+1. **Search** — type in the search bar to query across all columns (name, notes, total, order ID, status, region, date) via GIN trigram index; sub-second on 4 M+ rows.
+2. **Filter** — use the sidebar to narrow by status, region, date range, or total amount.
+3. **Aggregates chart** — the chart shows daily orders by product category; drag the brush to zoom into any date window.
 
 ---
 
@@ -45,6 +51,16 @@ Browser ──HTTPS──► Nginx / Cloud Run ──proxy /api/* (SNI)──►
 ./scripts/deploy.sh      # local [1] or GCP [2]
 ./scripts/infra-down.sh  # stop local [1] or teardown GCP [2]
 ./scripts/scale.sh       # interactive menu — scale up/down, pause/resume schedule
+```
+
+`./scripts/deploy.sh` prompts for local or GCP on every run:
+
+```
+./scripts/deploy.sh
+  [1] Local  — starts Spring Boot on :8080 (uses local PG from .env)
+  [2] GCP    — docker build → push to Artifact Registry → pulumi up --yes
+                 provisions VPC · GCE Postgres VM · Cloud Run backend · Secret Manager
+                 auto-restores demo snapshot from GCS if orders table is empty
 ```
 
 ### Cost control — scheduled 8am–5pm Pacific window (weekdays)
