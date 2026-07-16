@@ -88,6 +88,157 @@ GCP_REGION="${GCP_REGION:-us-central1}"
 [[ -n "$GCP_PROJECT" ]] || { printf 'GCP project could not be detected. Set GCP_PROJECT or run: gcloud config set project <id>\n' >&2; exit 1; }
 
 printf '\n[infra-down] project: %s  region: %s\n' "$GCP_PROJECT" "$GCP_REGION"
+
+_P_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash-full')
+_P_CLUSTER="${_P_PREFIX}-cluster"
+_P_ZONE="${GCP_REGION}-a"
+_P_IS_GKE=0
+gcloud container clusters describe "$_P_CLUSTER" \
+  --zone "$_P_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1 && _P_IS_GKE=1 || true
+
+if (( _P_IS_GKE )); then
+  _P_NODES=$(gcloud container clusters describe "$_P_CLUSTER" \
+    --zone "$_P_ZONE" --project "$GCP_PROJECT" \
+    --format="value(currentNodeCount)" 2>/dev/null || echo "?")
+  printf '  Current: GKE · nodes=%s\n' "$_P_NODES"
+else
+  _P_CR_MIN=$(gcloud run services describe "${_P_PREFIX}-backend" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT" \
+    --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])" \
+    2>/dev/null || echo "?")
+  printf '  Current: Cloud Run · min-instances=%s\n' "${_P_CR_MIN:-0}"
+fi
+
+_SCHED_UP_STATE=$(gcloud scheduler jobs describe "${_P_PREFIX}-gke-scale-up" \
+  --location "$GCP_REGION" --project "$GCP_PROJECT" \
+  --format="value(state)" 2>/dev/null || echo "NOT_CREATED")
+printf '  Auto-schedule: starts 8am · stops 5pm · weekdays Pacific · state=%s\n' "$_SCHED_UP_STATE"
+printf '  [1] Start now  [2] Stop now  [3] Suspend schedule  [4] Resume schedule  [enter] Tear down: '
+read -r _PRE_ACTION
+case "${_PRE_ACTION:-}" in
+  1)
+    if (( _P_IS_GKE )); then
+      _SCHED_SA="${_P_PREFIX}-gke-sched-sa@${GCP_PROJECT}.iam.gserviceaccount.com"
+      _PROJ_NUM=$(gcloud projects describe "$GCP_PROJECT" --format="value(projectNumber)" 2>/dev/null || true)
+      _CS_AGENT="serviceAccount:service-${_PROJ_NUM}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+      _BOUND=$(gcloud iam service-accounts get-iam-policy "$_SCHED_SA" \
+        --project "$GCP_PROJECT" --format=json 2>/dev/null \
+        | python3 -c "import sys,json;d=json.load(sys.stdin);print('yes' if any('serviceAccountTokenCreator' in b.get('role','') and any('cloudscheduler' in m for m in b.get('members',[])) for b in d.get('bindings',[])) else 'no')" 2>/dev/null || echo "no")
+      if [[ "$_BOUND" != "yes" ]]; then
+        printf '  Fixing scheduler IAM (missing token-creator binding)...\n'
+        gcloud iam service-accounts add-iam-policy-binding "$_SCHED_SA" \
+          --member="$_CS_AGENT" \
+          --role="roles/iam.serviceAccountTokenCreator" \
+          --project="$GCP_PROJECT" --quiet
+        printf '  IAM binding applied — scheduler will work at next 8am run.\n'
+      fi
+      printf '  Starting — GKE node pool → 1...\n'
+      gcloud container clusters resize "$_P_CLUSTER" \
+        --node-pool default-pool --num-nodes 1 \
+        --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
+      printf '  Node coming up — Spring Boot ready in ~2-3 min.\n'
+    else
+      gcloud scheduler jobs run "${_P_PREFIX}-scale-up-backend" \
+        --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
+        && printf '  Started — Cloud Run min-instances now 1.\n' \
+        || printf '  (scheduler job not yet created — will exist after first deploy)\n'
+    fi
+    exit 0
+    ;;
+  2)
+    if (( _P_IS_GKE )); then
+      printf '  Stopping — GKE node pool → 0...\n'
+      gcloud container clusters resize "$_P_CLUSTER" \
+        --node-pool default-pool --num-nodes 0 \
+        --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
+      printf '  Stopped — no node charges until next start.\n'
+    else
+      gcloud scheduler jobs run "${_P_PREFIX}-scale-down-backend" \
+        --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
+        && printf '  Stopped — Cloud Run min-instances now 0.\n' \
+        || printf '  (scheduler job not yet created — will exist after first deploy)\n'
+    fi
+    exit 0
+    ;;
+  3)
+    if [[ "$_SCHED_UP_STATE" == "PAUSED" ]]; then
+      printf '  Schedule is already PAUSED — nothing to do.\n'
+      exit 0
+    fi
+    if [[ "$_SCHED_UP_STATE" == "NOT_CREATED" ]]; then
+      printf '  Scheduler jobs not yet created — run a full deploy first.\n'
+      exit 1
+    fi
+    if (( _P_IS_GKE )) && [[ "${_P_NODES:-0}" != "0" ]]; then
+      printf '  WARNING: nodes are still running (%s). They will not auto-stop at 5pm while suspended.\n' "$_P_NODES"
+      printf '  Stop nodes too? [y/N] '
+      read -r _STOP_NODES
+      if [[ "$_STOP_NODES" =~ ^[Yy]$ ]]; then
+        printf '  Stopping — GKE node pool → 0...\n'
+        gcloud container clusters resize "$_P_CLUSTER" \
+          --node-pool default-pool --num-nodes 0 \
+          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
+        printf '  Nodes stopped.\n'
+      fi
+    fi
+    if (( _P_IS_GKE )); then
+      gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      printf '  Schedule suspended.\n' || printf '  ERROR: failed to suspend one or both scheduler jobs.\n'
+    else
+      gcloud scheduler jobs pause "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      gcloud scheduler jobs pause "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      printf '  Schedule suspended.\n' || printf '  ERROR: failed to suspend one or both scheduler jobs.\n'
+    fi
+    exit 0
+    ;;
+  4)
+    if [[ "$_SCHED_UP_STATE" == "ENABLED" ]]; then
+      printf '  Schedule is already ENABLED — nothing to do.\n'
+      exit 0
+    fi
+    if [[ "$_SCHED_UP_STATE" == "NOT_CREATED" ]]; then
+      printf '  Scheduler jobs not yet created — run a full deploy first.\n'
+      exit 1
+    fi
+    if (( _P_IS_GKE )); then
+      _SCHED_SA="${_P_PREFIX}-gke-sched-sa@${GCP_PROJECT}.iam.gserviceaccount.com"
+      _PROJ_NUM=$(gcloud projects describe "$GCP_PROJECT" --format="value(projectNumber)" 2>/dev/null || true)
+      _CS_AGENT="serviceAccount:service-${_PROJ_NUM}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+      _BOUND=$(gcloud iam service-accounts get-iam-policy "$_SCHED_SA" \
+        --project "$GCP_PROJECT" --format=json 2>/dev/null \
+        | python3 -c "import sys,json;d=json.load(sys.stdin);print('yes' if any('serviceAccountTokenCreator' in b.get('role','') and any('cloudscheduler' in m for m in b.get('members',[])) for b in d.get('bindings',[])) else 'no')" 2>/dev/null || echo "no")
+      if [[ "$_BOUND" != "yes" ]]; then
+        printf '  Fixing scheduler IAM (missing token-creator binding)...\n'
+        gcloud iam service-accounts add-iam-policy-binding "$_SCHED_SA" \
+          --member="$_CS_AGENT" \
+          --role="roles/iam.serviceAccountTokenCreator" \
+          --project="$GCP_PROJECT" --quiet
+        printf '  IAM binding applied.\n'
+      fi
+      gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      printf '  Schedule resumed — nodes will start at next 8am weekday run.\n' || printf '  ERROR: failed to resume one or both scheduler jobs.\n'
+    else
+      gcloud scheduler jobs resume "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      gcloud scheduler jobs resume "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" && \
+      printf '  Schedule resumed.\n' || printf '  ERROR: failed to resume one or both scheduler jobs.\n'
+    fi
+    exit 0
+    ;;
+esac
+
+_GKE_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash-full')
+_GKE_CLUSTER="${_GKE_PREFIX}-cluster"
+_GKE_ZONE="${GCP_REGION}-a"
+if gcloud container clusters describe "$_GKE_CLUSTER" \
+    --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+  printf '[infra-down] Deleting GKE cluster %s (zero ongoing cost)...\n' "$_GKE_CLUSTER"
+  gcloud container clusters delete "$_GKE_CLUSTER" \
+    --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+  printf '[infra-down] GKE cluster deleted.\n'
+fi
+
 printf '[infra-down] Destroying Cloud Run, Postgres VM, VPC, Secret Manager, Artifact Registry...\n'
 
 cd "$INFRA_DIR"

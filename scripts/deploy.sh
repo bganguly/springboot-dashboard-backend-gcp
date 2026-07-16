@@ -53,14 +53,28 @@ esac
 
 BACKEND_RUNTIME="cr"
 if [[ "$_TARGET" == "remote" ]]; then
+  _EXISTING_RUNTIME=$(python3 -c "
+import re, sys
+try:
+    content = open('$ROOT_DIR/infra/Pulumi.${DEPLOY_MODE}.yaml').read()
+    m = re.search(r'backendRuntime:\s*(\S+)', content)
+    print(m.group(1) if m else 'cr')
+except Exception:
+    print('cr')
+" 2>/dev/null || echo "cr")
   printf '\n  Backend runtime:\n'
-  printf '  [1] Cloud Run — serverless, scales to zero (default)\n'
+  printf '  [1] Cloud Run — serverless, scales to zero\n'
   printf '  [2] GKE       — Kubernetes on e2-standard-2 node\n'
-  printf '\nChoice [1/2, default 1]: '
+  if [[ "$_EXISTING_RUNTIME" == "gke" ]]; then
+    printf '\nChoice [1/2, default 2 — gke (current)]: '
+  else
+    printf '\nChoice [1/2, default 1 — cr]: '
+  fi
   read -r _BR
   case "$_BR" in
+    1) BACKEND_RUNTIME="cr"  ;;
     2) BACKEND_RUNTIME="gke" ;;
-    *) BACKEND_RUNTIME="cr"  ;;
+    *) BACKEND_RUNTIME="$_EXISTING_RUNTIME" ;;
   esac
 fi
 
@@ -68,13 +82,13 @@ if [[ "$_TARGET" == "remote" ]]; then
   if [[ "$DEPLOY_MODE" == "lite" ]]; then
     printf '\n--- Lite GCP summary ---\n'
     if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
-      printf '  Backend:    GKE (e2-standard-4 node, always-on)\n'
+      printf '  Backend:    GKE (e2-standard-2 node, scheduled 8am-5pm weekdays)\n'
       printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
-      printf '  Cost est:   ~$65/mo if left running (e2-standard-4 GKE node + e2-standard-2 DB VM)\n'
+      printf '  Cost est:   ~$30/mo scheduled (~$66/mo if left running)\n'
     else
-      printf '  Backend:    Cloud Run (min-instances: 0, scales to zero)\n'
-      printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD\n'
-      printf '  Cost est:   ~$17/mo if left running (DB VM dominates)\n'
+      printf '  Backend:    Cloud Run · min=1 8am-5pm PST weekdays; min=0 off-hours (cold start ~5s on first request)\n'
+      printf '  DB:         e2-standard-2 Postgres 16 VM (2 vCPU, 8 GB), 20 GB SSD (always-on)\n'
+      printf '  Cost est:   ~$17/mo GCP · ~$10/mo NextJS AWS (scheduled) · ~$27/mo combined\n'
     fi
   else
     printf '\n'
@@ -327,84 +341,6 @@ TAG="${TAG:-$(date +%Y%m%d%H%M%S)}"
 
 printf '\n=== deployment config ===\n'
 printf '  Project: %s\n  Region:  %s\n' "$GCP_PROJECT" "$GCP_REGION"
-
-if [[ "$_TARGET" == "remote" ]]; then
-  _P_PREFIX=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'dash-lite' || printf 'dash-full')
-  _P_CLUSTER="${_P_PREFIX}-cluster"
-  _P_ZONE="${GCP_REGION}-a"
-  _P_IS_GKE=0
-  gcloud container clusters describe "$_P_CLUSTER" \
-    --zone "$_P_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1 && _P_IS_GKE=1 || true
-
-  if (( _P_IS_GKE )); then
-    _P_NODES=$(gcloud container clusters describe "$_P_CLUSTER" \
-      --zone "$_P_ZONE" --project "$GCP_PROJECT" \
-      --format="value(currentNodeCount)" 2>/dev/null || echo "?")
-    printf '  Current: GKE · nodes=%s\n' "$_P_NODES"
-  else
-    _P_CR_MIN=$(gcloud run services describe "${_P_PREFIX}-backend" \
-      --region "$GCP_REGION" --project "$GCP_PROJECT" \
-      --format="value(spec.template.metadata.annotations['autoscaling.knative.dev/minScale'])" \
-      2>/dev/null || echo "?")
-    printf '  Current: Cloud Run · min-instances=%s\n' "${_P_CR_MIN:-0}"
-  fi
-
-  printf '  Auto-schedule: starts 8am · stops 5pm · weekdays Pacific.\n'
-  printf '  [1] Start now  [2] Stop now  [3] Suspend schedule  [4] Resume schedule  [enter] Continue: '
-  read -r _PRE_ACTION
-  case "${_PRE_ACTION:-}" in
-    1)
-      if (( _P_IS_GKE )); then
-        printf '  Starting — GKE node pool → 1...\n'
-        gcloud container clusters resize "$_P_CLUSTER" \
-          --node-pool default-pool --num-nodes 1 \
-          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
-        printf '  Node coming up — Spring Boot ready in ~2-3 min.\n'
-      else
-        gcloud scheduler jobs run "${_P_PREFIX}-scale-up-backend" \
-          --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
-          && printf '  Started — Cloud Run min-instances now 1.\n' \
-          || printf '  (scheduler job not yet created — will exist after first deploy)\n'
-      fi
-      ;;
-    2)
-      if (( _P_IS_GKE )); then
-        printf '  Stopping — GKE node pool → 0...\n'
-        gcloud container clusters resize "$_P_CLUSTER" \
-          --node-pool default-pool --num-nodes 0 \
-          --zone "$_P_ZONE" --project "$GCP_PROJECT" --quiet
-        printf '  Stopped — no node charges until next start.\n'
-      else
-        gcloud scheduler jobs run "${_P_PREFIX}-scale-down-backend" \
-          --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null \
-          && printf '  Stopped — Cloud Run min-instances now 0.\n' \
-          || printf '  (scheduler job not yet created — will exist after first deploy)\n'
-      fi
-      ;;
-    3)
-      if (( _P_IS_GKE )); then
-        gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs pause "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      else
-        gcloud scheduler jobs pause "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs pause "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      fi
-      printf '  Schedule suspended.\n'
-      ;;
-    4)
-      if (( _P_IS_GKE )); then
-        gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-up"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs resume "${_P_PREFIX}-gke-scale-down" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      else
-        gcloud scheduler jobs resume "${_P_PREFIX}-scale-up-backend"   --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-        gcloud scheduler jobs resume "${_P_PREFIX}-scale-down-backend" --location "$GCP_REGION" --project "$GCP_PROJECT" 2>/dev/null || true
-      fi
-      printf '  Schedule resumed.\n'
-      ;;
-    *)
-      ;;
-  esac
-fi
 
 printf '  Checking Artifact Registry API...\n'
 AR_STATE=$(gcloud services list \
@@ -982,14 +918,25 @@ BAKE_EOF
   fi
 fi
 
+  printf '\n  Syncing daily_order_count from orders table...\n'
+  gcloud compute ssh "${_pg_vm}" \
+    --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" \
+    --tunnel-through-iap --ssh-flag="-o ConnectTimeout=10" \
+    --command "sudo -u postgres psql -d app -c \"INSERT INTO daily_order_count (date, \\\"totalOrders\\\") SELECT \\\"placedAt\\\"::date, COUNT(*) FROM orders GROUP BY \\\"placedAt\\\"::date ON CONFLICT (date) DO UPDATE SET \\\"totalOrders\\\" = EXCLUDED.\\\"totalOrders\\\";\"" \
+    2>/dev/null \
+    && printf '  daily_order_count synced.\n' \
+    || printf '  (daily_order_count sync skipped — SSH unavailable)\n'
+
   if [[ "$BACKEND_RUNTIME" != "gke" ]]; then
     _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
     _GKE_ZONE="${GCP_REGION}-a"
     if gcloud container clusters describe "$_GKE_CLUSTER" \
         --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
-      printf '  Tearing down GKE cluster %s (switched to Cloud Run)...\n' "$_GKE_CLUSTER"
-      gcloud container clusters delete "$_GKE_CLUSTER" \
+      printf '  Switched to Cloud Run — scaling GKE cluster %s to 0 nodes (preserving for next GKE deploy)...\n' "$_GKE_CLUSTER"
+      gcloud container clusters resize "$_GKE_CLUSTER" \
+        --node-pool default-pool --num-nodes 0 \
         --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+      printf '  GKE cluster preserved at 0 nodes — no node charges until next GKE deploy.\n'
     fi
   fi
 
@@ -997,7 +944,7 @@ fi
     _GKE_CLUSTER="${DEPLOY_MODE_PREFIX}-cluster"
     _GKE_ZONE="${GCP_REGION}-a"
     _GKE_NS="${DEPLOY_MODE_PREFIX}"
-    _GKE_MACHINE_TYPE="e2-standard-4"
+    _GKE_MACHINE_TYPE=$([[ "$DEPLOY_MODE" == "lite" ]] && printf 'e2-standard-2' || printf 'e2-standard-4')
     gcloud services enable container.googleapis.com --project "$GCP_PROJECT" 2>/dev/null || true
     if gcloud container clusters describe "$_GKE_CLUSTER" \
         --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
@@ -1012,6 +959,17 @@ fi
         printf '  GKE cluster %s already exists (%s).\n' "$_GKE_CLUSTER" "$_GKE_MACHINE_TYPE"
         gcloud container clusters get-credentials "$_GKE_CLUSTER" \
           --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+        _CURRENT_NODES=$(gcloud container clusters describe "$_GKE_CLUSTER" \
+          --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
+          --format="value(currentNodeCount)" 2>/dev/null || echo "0")
+        if [[ "${_CURRENT_NODES:-0}" == "0" ]]; then
+          printf '  Cluster at 0 nodes — scaling up to 1...\n'
+          gcloud container clusters resize "$_GKE_CLUSTER" \
+            --node-pool default-pool --num-nodes 1 \
+            --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+          printf '  Node coming up — waiting ~60s for readiness...\n'
+          sleep 60
+        fi
       fi
     fi
     if ! gcloud container clusters describe "$_GKE_CLUSTER" \
@@ -1229,4 +1187,22 @@ if [[ "$_TARGET" == "remote" ]]; then
     printf '\n  !! REMINDER: FULL MODE IS RUNNING (~$200-300/mo) — RUN infra-down.sh WHEN DONE\n'
   fi
 
+fi
+
+if [[ "$_TARGET" == "remote" && "$BACKEND_RUNTIME" == "gke" ]]; then
+  _HOUR_PST=$(TZ="America/Los_Angeles" date +%H)
+  _DOW_PST=$(TZ="America/Los_Angeles" date +%u)
+  _OUTSIDE_HOURS=0
+  (( 10#$_HOUR_PST < 8 || 10#$_HOUR_PST >= 17 )) && _OUTSIDE_HOURS=1
+  (( _DOW_PST >= 6 )) && _OUTSIDE_HOURS=1
+  if (( _OUTSIDE_HOURS )); then
+    printf '\n=== outside working hours — scaling GKE nodes to 0 ===\n'
+    printf '  Scheduler will restart nodes at next 8am PST weekday.\n'
+    gcloud container clusters resize "${DEPLOY_MODE_PREFIX}-cluster" \
+      --node-pool default-pool --num-nodes 0 \
+      --zone "${GCP_REGION}-a" --project "$GCP_PROJECT" --quiet
+    printf '  Nodes stopped — app unreachable until next 8am PST.\n'
+  else
+    printf '\n  GKE nodes active — scheduler will stop them at 5pm PST.\n'
+  fi
 fi
