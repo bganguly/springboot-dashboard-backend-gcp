@@ -226,7 +226,7 @@ if (backendRuntime !== "gke") {
   new gcp.cloudscheduler.Job("scale-up-backend", {
     name: `${namePrefix}-scale-up-backend`,
     region,
-    schedule: "0 8 * * *",
+    schedule: "0 8 * * 1-5",
     timeZone: "America/Los_Angeles",
     httpTarget: {
       uri: _patchUri,
@@ -240,7 +240,7 @@ if (backendRuntime !== "gke") {
   new gcp.cloudscheduler.Job("scale-down-backend", {
     name: `${namePrefix}-scale-down-backend`,
     region,
-    schedule: "0 17 * * *",
+    schedule: "0 17 * * 1-5",
     timeZone: "America/Los_Angeles",
     httpTarget: {
       uri: _patchUri,
@@ -271,6 +271,13 @@ if (backendRuntime === "gke") {
     member: pulumi.interpolate`serviceAccount:${gkeSchedSa.email}`,
   });
 
+  const projectData = gcp.organizations.getProject({ projectId: project });
+  new gcp.serviceaccount.IAMMember("gke-sched-sa-token-creator", {
+    serviceAccountId: gkeSchedSa.name,
+    role: "roles/iam.serviceAccountTokenCreator",
+    member: pulumi.interpolate`serviceAccount:service-${pulumi.output(projectData).apply(p => p.number)}@gcp-sa-cloudscheduler.iam.gserviceaccount.com`,
+  });
+
   const _nodeUp   = Buffer.from(JSON.stringify({ nodeCount: 1 })).toString("base64");
   const _nodeDown = Buffer.from(JSON.stringify({ nodeCount: 0 })).toString("base64");
 
@@ -284,7 +291,7 @@ if (backendRuntime === "gke") {
       httpMethod: "POST",
       body: _nodeUp,
       headers: { "Content-Type": "application/json" },
-      oidcToken: { serviceAccountEmail: gkeSchedSa.email, audience: "https://container.googleapis.com/" },
+      oauthToken: { serviceAccountEmail: gkeSchedSa.email, scope: "https://www.googleapis.com/auth/cloud-platform" },
     },
   }, { dependsOn: apis });
 
@@ -298,7 +305,7 @@ if (backendRuntime === "gke") {
       httpMethod: "POST",
       body: _nodeDown,
       headers: { "Content-Type": "application/json" },
-      oidcToken: { serviceAccountEmail: gkeSchedSa.email, audience: "https://container.googleapis.com/" },
+      oauthToken: { serviceAccountEmail: gkeSchedSa.email, scope: "https://www.googleapis.com/auth/cloud-platform" },
     },
   }, { dependsOn: apis });
 }
