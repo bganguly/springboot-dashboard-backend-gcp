@@ -310,6 +310,52 @@ if (backendRuntime === "gke") {
   }, { dependsOn: apis });
 }
 
+// ── DB VM scheduler (weekdays 7:45am start → 5:10pm stop Pacific) ────────────
+// Starts 15 min before the Cloud Run backend warm-up at 8am so Postgres is
+// ready when the first request arrives. Stops 10 min after backend scales down.
+const dbVmSchedSa = new gcp.serviceaccount.Account("db-vm-sched-sa", {
+  accountId: `${namePrefix}-dbvm-sched-sa`,
+  displayName: "DB VM start/stop scheduler",
+});
+
+new gcp.projects.IAMMember("db-vm-sched-instance-admin", {
+  project,
+  role: "roles/compute.instanceAdmin.v1",
+  member: pulumi.interpolate`serviceAccount:${dbVmSchedSa.email}`,
+});
+
+const _vmStartUri = `https://compute.googleapis.com/compute/v1/projects/${project}/zones/${region}-a/instances/${namePrefix}-pg/start`;
+const _vmStopUri  = `https://compute.googleapis.com/compute/v1/projects/${project}/zones/${region}-a/instances/${namePrefix}-pg/stop`;
+const _emptyBody  = Buffer.from("{}").toString("base64");
+
+new gcp.cloudscheduler.Job("db-vm-start", {
+  name: `${namePrefix}-db-vm-start`,
+  region,
+  schedule: "45 7 * * 1-5",
+  timeZone: "America/Los_Angeles",
+  httpTarget: {
+    uri: _vmStartUri,
+    httpMethod: "POST",
+    body: _emptyBody,
+    headers: { "Content-Type": "application/json" },
+    oauthToken: { serviceAccountEmail: dbVmSchedSa.email, scope: "https://www.googleapis.com/auth/cloud-platform" },
+  },
+}, { dependsOn: apis });
+
+new gcp.cloudscheduler.Job("db-vm-stop", {
+  name: `${namePrefix}-db-vm-stop`,
+  region,
+  schedule: "10 17 * * 1-5",
+  timeZone: "America/Los_Angeles",
+  httpTarget: {
+    uri: _vmStopUri,
+    httpMethod: "POST",
+    body: _emptyBody,
+    headers: { "Content-Type": "application/json" },
+    oauthToken: { serviceAccountEmail: dbVmSchedSa.email, scope: "https://www.googleapis.com/auth/cloud-platform" },
+  },
+}, { dependsOn: apis });
+
 // ── Outputs ───────────────────────────────────────────────────────────────────
 export const dbVmInternalIp   = dbVmIp;
 export const artifactRegistry = pulumi.interpolate`${region}-docker.pkg.dev/${project}/${registry.repositoryId}`;
