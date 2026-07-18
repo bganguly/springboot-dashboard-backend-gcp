@@ -91,6 +91,8 @@ One-liners still work: `TIER=lite ./scripts/scale.sh up` / `down`
 
 ## Live Service
 
+> **Schedule:** Cloud Run scales to zero on a Cloud Scheduler weekday schedule (8 am – 5 pm PT). Outside those hours the app is offline; first request after 8 am may cold-start (~5–10 s).
+
 | | URL |
 |---|---|
 | **App** | https://dash-lite-frontend-77y7e2wykq-uc.a.run.app |
