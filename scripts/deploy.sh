@@ -64,7 +64,7 @@ except Exception:
 " 2>/dev/null || echo "cr")
   printf '\n  Backend runtime:\n'
   printf '  [1] Cloud Run — serverless, scales to zero\n'
-  printf '  [2] GKE       — Kubernetes on e2-standard-2 node\n'
+  printf '  [2] GKE       — Kubernetes on e2-standard-2 node (~$22/mo scheduled)\n'
   if [[ "$_EXISTING_RUNTIME" == "gke" ]]; then
     printf '\nChoice [1/2, default 2 — gke (current)]: '
   else
