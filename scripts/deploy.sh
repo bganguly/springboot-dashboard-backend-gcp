@@ -43,9 +43,9 @@ printf '  [3] Full   — GCP: Cloud Run backend (min-0) + n2-standard-4 Postgres
 (( _full_count > 0 )) && printf ' [%s resources active]' "$_full_count" || printf ' [not deployed]'
 printf '\n'
 printf '               Full uses a larger Postgres VM.\n'
-printf '\nChoice [1/2/3]: '
+printf '\nChoice [1/2/3, default 2]: '
 read -r _MODE
-case "$_MODE" in
+case "${_MODE:-2}" in
   2) _TARGET="remote"; DEPLOY_MODE="lite" ;;
   3) _TARGET="remote"; DEPLOY_MODE="full" ;;
   *) _TARGET="local";  DEPLOY_MODE=""    ;;
